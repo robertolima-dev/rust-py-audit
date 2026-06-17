@@ -18,6 +18,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
+        env:
+          # `ring` (puxado por `rustls`, via `reqwest`) falha ao cross-compilar
+          # sua assembly pregenerada para aarch64 dentro do container manylinux
+          # do maturin-action: o cross-gcc não define `__ARM_ARCH` por padrão
+          # nesse ambiente, e o preprocessor de `ring` exige essa macro
+          # (erro: "ARM assembler must define __ARM_ARCH"). Forçar a macro via
+          # CFLAGS é o workaround padrão para esse problema conhecido — não
+          # afeta o build x86_64 (a env var é específica do target aarch64).
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
