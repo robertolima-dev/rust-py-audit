@@ -17,6 +17,15 @@ pub enum AuditError {
     /// Falha de I/O ao acessar o arquivo de eventos (permissão,
     /// disco, diretório inexistente, etc).
     Io(String),
+    /// Configuração inválida passada pelo usuário (ex.: `mode`
+    /// desconhecido, ou `mode="remote"`/`"hybrid"` sem
+    /// `immutablelog_url`/`immutablelog_api_key`).
+    Config(String),
+    /// Falha ao entregar um evento ao ImmutableLog em `mode="remote"`
+    /// (erro permanente, ou retries esgotados em erro retryable). Em
+    /// `mode="hybrid"` isso NÃO é levantado como exceção — vira
+    /// `delivery_status="pending"` em vez disso.
+    ImmutableLog(String),
 }
 
 impl fmt::Display for AuditError {
@@ -26,7 +35,15 @@ impl fmt::Display for AuditError {
                 write!(f, "falha ao serializar evento: {message}")
             }
             AuditError::Io(message) => write!(f, "falha de I/O: {message}"),
+            AuditError::Config(message) => write!(f, "configuração inválida: {message}"),
+            AuditError::ImmutableLog(message) => write!(f, "{message}"),
         }
+    }
+}
+
+impl From<crate::immutablelog_client::ImmutableLogClientError> for AuditError {
+    fn from(err: crate::immutablelog_client::ImmutableLogClientError) -> Self {
+        AuditError::ImmutableLog(err.to_string())
     }
 }
 
@@ -55,6 +72,15 @@ impl From<AuditError> for pyo3::PyErr {
             // (`open()`, por exemplo), então o comportamento já é
             // familiar para quem usa a lib.
             AuditError::Io(message) => pyo3::exceptions::PyOSError::new_err(message),
+            // Erro de configuração -> ValueError: o problema é um
+            // argumento inválido passado pelo chamador (mesma categoria
+            // que o Python já usa para argumentos inválidos).
+            AuditError::Config(message) => pyo3::exceptions::PyValueError::new_err(message),
+            // Erro de delivery -> RuntimeError: a operação local (criar
+            // e hashear o evento) funcionou; o que falhou foi contatar
+            // um serviço externo, categoria que o Python não tem uma
+            // exceção mais específica e amplamente reconhecida para.
+            AuditError::ImmutableLog(message) => pyo3::exceptions::PyRuntimeError::new_err(message),
         }
     }
 }

@@ -20,6 +20,15 @@ app = FastAPI(title="rust-py-audit FastAPI example")
 # fora" da pilha, vendo o status_code final de qualquer middleware
 # adicionado depois.
 app.add_middleware(AuditMiddleware, app_name="billing-api", file_path="./audit.jsonl")
+# Com ImmutableLog (ver examples/immutablelog_basic.py e o README):
+# app.add_middleware(
+#     AuditMiddleware,
+#     app_name="billing-api",
+#     file_path="./audit.jsonl",
+#     mode="hybrid",
+#     immutablelog_url="https://api.immutablelog.com",
+#     immutablelog_api_key="iml_live_xxxxx",
+# )
 
 
 @app.get("/")

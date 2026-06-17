@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from rust_py_audit import AuditLogger
 
 
@@ -8,6 +10,74 @@ def test_creates_logger_with_explicit_file_path():
 
     assert audit.app_name == "billing-api"
     assert audit.file_path == "./audit.jsonl"
+
+
+def test_mode_defaults_to_local(tmp_path):
+    audit = AuditLogger(app_name="billing-api", file_path=str(tmp_path / "audit.jsonl"))
+
+    assert audit.mode == "local"
+    assert audit.immutablelog_url is None
+    assert audit.timeout_ms == 500
+    assert audit.retry_enabled is True
+    assert audit.max_retries == 3
+
+
+def test_mode_local_explicit(tmp_path):
+    audit = AuditLogger(
+        app_name="billing-api",
+        file_path=str(tmp_path / "audit.jsonl"),
+        mode="local",
+    )
+
+    assert audit.mode == "local"
+
+
+def test_invalid_mode_raises_value_error(tmp_path):
+    with pytest.raises(ValueError):
+        AuditLogger(
+            app_name="billing-api",
+            file_path=str(tmp_path / "audit.jsonl"),
+            mode="turbo",
+        )
+
+
+def test_remote_mode_without_credentials_raises_value_error(tmp_path):
+    with pytest.raises(ValueError):
+        AuditLogger(
+            app_name="billing-api",
+            file_path=str(tmp_path / "audit.jsonl"),
+            mode="remote",
+        )
+
+
+def test_hybrid_mode_with_explicit_credentials(tmp_path):
+    audit = AuditLogger(
+        app_name="billing-api",
+        file_path=str(tmp_path / "audit.jsonl"),
+        mode="hybrid",
+        immutablelog_url="https://api.immutablelog.com",
+        immutablelog_api_key="iml_live_xxx",
+        timeout_ms=2000,
+        retry_enabled=False,
+        max_retries=5,
+    )
+
+    assert audit.mode == "hybrid"
+    assert audit.immutablelog_url == "https://api.immutablelog.com"
+    assert audit.timeout_ms == 2000
+    assert audit.retry_enabled is False
+    assert audit.max_retries == 5
+
+
+def test_mode_and_credentials_fall_back_to_env_vars(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUST_PY_AUDIT_MODE", "remote")
+    monkeypatch.setenv("IMMUTABLELOG_URL", "https://api.immutablelog.com")
+    monkeypatch.setenv("IMMUTABLELOG_API_KEY", "iml_live_from_env")
+
+    audit = AuditLogger(app_name="billing-api", file_path=str(tmp_path / "audit.jsonl"))
+
+    assert audit.mode == "remote"
+    assert audit.immutablelog_url == "https://api.immutablelog.com"
 
 
 def test_file_path_has_a_default_value():

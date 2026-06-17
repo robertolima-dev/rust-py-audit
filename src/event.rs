@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::immutablelog_receipt::ImmutableLogReceipt;
+
 /// Um evento de auditoria, já com seu hash calculado.
 ///
 /// `#[derive(...)]` pede ao compilador para gerar implementações
@@ -46,6 +48,31 @@ pub struct AuditEvent {
     /// de vez a classe de bug "esqueci de checar null".
     pub previous_hash: Option<String>,
     pub hash: String,
+    /// Classificação (`error`/`warning`/`info`/`success`) usada em
+    /// `meta.type` ao enviar para o ImmutableLog. Guardado aqui (e não
+    /// só passado direto pra `immutablelog_client.rs`) para que
+    /// `flush_pending()` consiga reenviar mais tarde com a MESMA
+    /// classificação original. Puramente operacional, igual
+    /// `immutablelog` abaixo: não entra no hash, e fica omitido do JSON
+    /// quando ninguém passa `severity` em `log()` — mantém o formato
+    /// local idêntico ao de antes desta opção existir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// Agrupador opcional (`meta.immutable_trail`), já sanitizado (ver
+    /// `immutablelog_client::sanitize_trail`). Mesma lógica de
+    /// `severity`: guardado para `flush_pending()`, omitido por padrão.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immutable_trail: Option<String>,
+    /// Receipt remoto do ImmutableLog (ou `status: "pending"` enquanto
+    /// não confirmado). Campo puramente operacional: vem DEPOIS de
+    /// `hash` na ordem dos campos e `hash.rs::HashPayload` não o lista,
+    /// então ele nunca entra no cálculo do hash — anexar/atualizar este
+    /// campo não invalida `verify()`. `skip_serializing_if` mantém o
+    /// JSON idêntico ao formato atual quando não há receipt (modo
+    /// `local`, ou eventos gravados antes desta versão), e
+    /// `#[serde(default)]` permite ler arquivos antigos sem o campo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immutablelog: Option<ImmutableLogReceipt>,
 }
 
 #[cfg(test)]
@@ -65,6 +92,9 @@ mod tests {
             metadata: json!({"ip": "192.168.0.10"}),
             previous_hash: None,
             hash: "abc123".to_string(),
+            severity: None,
+            immutable_trail: None,
+            immutablelog: None,
         }
     }
 

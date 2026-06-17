@@ -17,6 +17,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 use crate::event::AuditEvent;
+use crate::immutablelog_receipt::ImmutableLogReceipt;
 
 /// Converte um objeto Python qualquer em `serde_json::Value`.
 ///
@@ -118,6 +119,23 @@ pub fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyO
     }
 }
 
+/// Converte um `ImmutableLogReceipt` para o `dict` Python aninhado em
+/// `event["immutablelog"]`.
+fn receipt_to_pydict(py: Python<'_>, receipt: &ImmutableLogReceipt) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("status", &receipt.status)?;
+    dict.set_item("tx_id", receipt.tx_id.as_deref())?;
+    dict.set_item("payload_hash", receipt.payload_hash.as_deref())?;
+    dict.set_item("duplicate", receipt.duplicate)?;
+    dict.set_item("request_id", receipt.request_id.as_deref())?;
+    dict.set_item("remote_timestamp", receipt.remote_timestamp.as_deref())?;
+    dict.set_item("remote_status", receipt.remote_status.as_deref())?;
+    dict.set_item("block_id", receipt.block_id.as_deref())?;
+    dict.set_item("block_hash", receipt.block_hash.as_deref())?;
+    dict.set_item("event_hash", receipt.event_hash.as_deref())?;
+    Ok(dict.into())
+}
+
 /// Converte um `AuditEvent` inteiro para o `dict` Python que `log()` e
 /// `verify()` devolvem ao chamador.
 pub fn event_to_pydict(py: Python<'_>, event: &AuditEvent) -> PyResult<PyObject> {
@@ -135,5 +153,20 @@ pub fn event_to_pydict(py: Python<'_>, event: &AuditEvent) -> PyResult<PyObject>
     // manual aqui.
     dict.set_item("previous_hash", event.previous_hash.as_deref())?;
     dict.set_item("hash", &event.hash)?;
+    // `severity`/`immutable_trail` só aparecem quando o chamador passou
+    // esses argumentos em `log()` — do contrário o dict fica idêntico
+    // ao formato anterior a essa opção existir.
+    if let Some(severity) = &event.severity {
+        dict.set_item("severity", severity)?;
+    }
+    if let Some(immutable_trail) = &event.immutable_trail {
+        dict.set_item("immutable_trail", immutable_trail)?;
+    }
+    // Só aparece quando o evento já tem um receipt (modo `remote`/
+    // `hybrid`) — em `local`, o dict fica idêntico ao formato atual,
+    // sem a chave `immutablelog`.
+    if let Some(receipt) = &event.immutablelog {
+        dict.set_item("immutablelog", receipt_to_pydict(py, receipt)?)?;
+    }
     Ok(dict.into())
 }

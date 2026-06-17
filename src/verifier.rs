@@ -103,6 +103,9 @@ mod tests {
                 metadata: json!({"ip": "192.168.0.10"}),
                 previous_hash: previous_hash.clone(),
                 hash: String::new(),
+                severity: None,
+                immutable_trail: None,
+                immutablelog: None,
             };
             event.hash = compute_hash(&event).expect("hash não deveria falhar");
             previous_hash = Some(event.hash.clone());

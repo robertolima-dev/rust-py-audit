@@ -8,7 +8,11 @@ pub mod audit_logger;
 pub mod errors;
 pub mod event;
 pub mod hash;
+pub mod immutablelog_client;
+pub mod immutablelog_config;
+pub mod immutablelog_receipt;
 pub mod pyconv;
+pub mod retry;
 pub mod storage;
 pub mod verifier;
 

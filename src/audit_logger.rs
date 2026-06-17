@@ -8,7 +8,11 @@ use uuid::Uuid;
 
 use crate::event::AuditEvent;
 use crate::hash::compute_hash;
+use crate::immutablelog_client::{resolve_severity, sanitize_trail, ImmutableLogClient};
+use crate::immutablelog_config::{mode_from_env_or, AuditMode, ImmutableLogConfig};
+use crate::immutablelog_receipt::ImmutableLogReceipt;
 use crate::pyconv::{event_to_pydict, python_to_json};
+use crate::retry::send_with_retry;
 use crate::storage;
 use crate::verifier::verify_chain;
 
@@ -43,6 +47,19 @@ pub struct AuditLogger {
     app_name: String,
     file_path: PathBuf,
     last_hash: Option<String>,
+    /// Modo de operação (`local`/`remote`/`hybrid`). Por ora só fica
+    /// guardado e exposto via getter — `log()` ainda se comporta como
+    /// antes (sempre local) independente do valor aqui. O envio remoto
+    /// chega nas próximas etapas.
+    mode: AuditMode,
+    immutablelog: ImmutableLogConfig,
+    /// `Some` somente quando `mode` exige contato com o ImmutableLog
+    /// (`remote`/`hybrid`). Construído uma única vez em `new()` —
+    /// `reqwest::blocking::Client` já mantém um pool de conexões
+    /// internamente, então reusar a mesma instância entre chamadas de
+    /// `log()` é o comportamento certo (evita reconectar/renegociar TLS
+    /// a cada evento).
+    client: Option<ImmutableLogClient>,
 }
 
 #[pymethods]
@@ -52,10 +69,56 @@ impl AuditLogger {
     /// usar `?` para propagar um eventual erro de leitura do arquivo
     /// (ex.: arquivo existente mas corrompido) como uma exceção Python
     /// em vez de um panic.
+    /// `mode`, `immutablelog_url` e `immutablelog_api_key` aceitam
+    /// `None` (o default) para cair no fallback de variáveis de
+    /// ambiente (`RUST_PY_AUDIT_MODE`, `IMMUTABLELOG_URL`,
+    /// `IMMUTABLELOG_API_KEY`) e, por fim, em `mode="local"` se nada
+    /// for encontrado — preservando o comportamento de quem já chama
+    /// `AuditLogger(app_name, file_path)` sem saber que esses
+    /// parâmetros existem.
     #[new]
-    #[pyo3(signature = (app_name, file_path = "./audit.jsonl".to_string()))]
-    fn new(app_name: String, file_path: String) -> PyResult<Self> {
+    #[pyo3(signature = (
+        app_name,
+        file_path = "./audit.jsonl".to_string(),
+        mode = None,
+        immutablelog_url = None,
+        immutablelog_api_key = None,
+        timeout_ms = 500,
+        retry_enabled = true,
+        max_retries = 3,
+        immutablelog_env = None,
+    ))]
+    fn new(
+        app_name: String,
+        file_path: String,
+        mode: Option<String>,
+        immutablelog_url: Option<String>,
+        immutablelog_api_key: Option<String>,
+        timeout_ms: u64,
+        retry_enabled: bool,
+        max_retries: u8,
+        immutablelog_env: Option<String>,
+    ) -> PyResult<Self> {
         let file_path = PathBuf::from(file_path);
+
+        let mode_value = mode_from_env_or(mode, "local");
+        let mode = AuditMode::parse(&mode_value)?;
+
+        let immutablelog = ImmutableLogConfig::resolve(
+            immutablelog_url,
+            immutablelog_api_key,
+            timeout_ms,
+            retry_enabled,
+            max_retries,
+            immutablelog_env,
+        );
+        immutablelog.validate_for(mode)?;
+
+        let client = if mode.sends_to_immutablelog() {
+            Some(ImmutableLogClient::new(&immutablelog).map_err(crate::errors::AuditError::from)?)
+        } else {
+            None
+        };
 
         // Lê o arquivo (se existir) uma única vez, para inicializar o
         // cache de `last_hash`. `storage::read_events` já devolve uma
@@ -70,6 +133,9 @@ impl AuditLogger {
             app_name,
             file_path,
             last_hash,
+            mode,
+            immutablelog,
+            client,
         })
     }
 
@@ -81,6 +147,36 @@ impl AuditLogger {
     #[getter]
     fn file_path(&self) -> String {
         self.file_path.to_string_lossy().into_owned()
+    }
+
+    #[getter]
+    fn mode(&self) -> &'static str {
+        self.mode.as_str()
+    }
+
+    #[getter]
+    fn immutablelog_url(&self) -> Option<String> {
+        self.immutablelog.url.clone()
+    }
+
+    #[getter]
+    fn timeout_ms(&self) -> u64 {
+        self.immutablelog.timeout_ms
+    }
+
+    #[getter]
+    fn retry_enabled(&self) -> bool {
+        self.immutablelog.retry_enabled
+    }
+
+    #[getter]
+    fn max_retries(&self) -> u8 {
+        self.immutablelog.max_retries
+    }
+
+    #[getter]
+    fn immutablelog_env(&self) -> Option<String> {
+        self.immutablelog.env.clone()
     }
 
     /// Devolve o hash do último evento gravado, ou `None` se o logger
@@ -112,7 +208,13 @@ impl AuditLogger {
     /// PyO3 representa "um objeto Python qualquer, com vida limitada ao
     /// escopo do GIL atual" — não sabemos o tipo concreto até
     /// inspecioná-lo dentro de `python_to_json`.
-    #[pyo3(signature = (actor_id, action, resource, resource_id, metadata = None))]
+    /// `severity` e `immutable_trail` só afetam o que é enviado ao
+    /// ImmutableLog (`meta.type`/`meta.immutable_trail`) — não entram no
+    /// hash. `severity` precisa ser uma de `error`/`warning`/`info`/
+    /// `success` (default `"info"` se omitido); `immutable_trail` é
+    /// sanitizado (trim, sem `:`, máx. 256 chars) e omitido se vazio
+    /// depois disso.
+    #[pyo3(signature = (actor_id, action, resource, resource_id, metadata = None, severity = None, immutable_trail = None))]
     fn log(
         &mut self,
         py: Python<'_>,
@@ -121,11 +223,24 @@ impl AuditLogger {
         resource: String,
         resource_id: String,
         metadata: Option<Bound<'_, PyAny>>,
+        severity: Option<String>,
+        immutable_trail: Option<String>,
     ) -> PyResult<PyObject> {
         let metadata_value = match metadata {
             Some(value) => python_to_json(&value)?,
             None => serde_json::Value::Object(serde_json::Map::new()),
         };
+
+        // Valida `severity` já aqui (falha rápido), mesmo em
+        // `mode="local"` — se alguém passa um valor, ele precisa ser
+        // válido independente do modo. `resolved_severity` é o valor
+        // efetivo usado na PRIMEIRA tentativa de envio (default "info"
+        // quando `severity` é `None`); `event.severity` guarda só o que
+        // foi passado (ou `None`), para `flush_pending()` reenviar mais
+        // tarde com a mesma classificação original.
+        let resolved_severity =
+            resolve_severity(severity.as_deref()).map_err(crate::errors::AuditError::Config)?;
+        let sanitized_trail = sanitize_trail(immutable_trail.as_deref());
 
         // RFC3339 em UTC produz exatamente o formato do exemplo do MVP:
         // "2026-06-17T10:00:00Z". `map_err` converte o erro de
@@ -151,17 +266,67 @@ impl AuditLogger {
             metadata: metadata_value,
             previous_hash: self.last_hash.clone(),
             hash: String::new(),
+            // O hash é calculado a partir só dos campos acima (ver
+            // `hash.rs::HashPayload`) e NUNCA depois — o que vier do
+            // ImmutableLog é só metadado operacional, anexado depois,
+            // sem poder alterar essa "impressão digital" do evento.
+            severity,
+            immutable_trail: sanitized_trail,
+            immutablelog: None,
         };
 
         event.hash = compute_hash(&event)?;
 
-        // Só atualizamos `self.last_hash` (e devolvemos o evento) DEPOIS
-        // que `append_event` confirma que a gravação em disco deu certo
-        // — se a escrita falhar, o cache continua apontando para o
-        // último evento realmente persistido, e o erro sobe como
-        // exceção Python (via `From<AuditError> for PyErr`).
-        storage::append_event(&self.file_path, &event)?;
-        self.last_hash = Some(event.hash.clone());
+        match self.mode {
+            AuditMode::Local => {
+                storage::append_event(&self.file_path, &event)?;
+                self.last_hash = Some(event.hash.clone());
+            }
+            AuditMode::Remote => {
+                // Não grava JSONL local neste modo — se o envio falhar,
+                // o erro sobe como exceção Python e `self.last_hash`
+                // continua apontando para o último evento que de fato
+                // foi confirmado pelo ImmutableLog.
+                let receipt = self.send_to_immutablelog(
+                    py,
+                    &event,
+                    resolved_severity,
+                    event.immutable_trail.as_deref(),
+                )?;
+                event.immutablelog = Some(receipt);
+                self.last_hash = Some(event.hash.clone());
+            }
+            AuditMode::Hybrid => {
+                // Salva local PRIMEIRO: mesmo que o processo morra antes
+                // do envio terminar, o evento já está persistido (sem
+                // receipt ainda) — nunca perdemos o registro local por
+                // causa de uma falha de rede.
+                storage::append_event(&self.file_path, &event)?;
+                self.last_hash = Some(event.hash.clone());
+
+                match self.send_to_immutablelog(
+                    py,
+                    &event,
+                    resolved_severity,
+                    event.immutable_trail.as_deref(),
+                ) {
+                    Ok(receipt) => {
+                        event.immutablelog = Some(receipt.clone());
+                        storage::update_event_receipt(&self.file_path, &event.id, &receipt)?;
+                    }
+                    Err(_) => {
+                        // Falha em hybrid NÃO é exceção Python: o evento
+                        // já está seguro localmente, então devolvemos
+                        // status "pending" e deixamos para
+                        // `flush_pending()` tentar de novo depois.
+                        let pending_receipt = ImmutableLogReceipt::pending();
+                        event.immutablelog = Some(pending_receipt.clone());
+                        storage::update_event_receipt(&self.file_path, &event.id, &pending_receipt)?;
+                        storage::append_event(&storage::pending_path_for(&self.file_path), &event)?;
+                    }
+                }
+            }
+        }
 
         event_to_pydict(py, &event)
     }
@@ -192,5 +357,80 @@ impl AuditLogger {
         }
 
         Ok(dict.into())
+    }
+
+    /// Tenta reentregar ao ImmutableLog todo evento que ficou marcado
+    /// como `pending` (gravado em `audit.pending.jsonl`).
+    ///
+    /// Para cada evento pendente: tenta o envio (com o mesmo
+    /// `retry_enabled`/`max_retries` configurados no logger, e a mesma
+    /// `Idempotency-Key` de antes — `event.id` nunca muda). Em sucesso,
+    /// atualiza o receipt em `audit.jsonl` e remove o evento da fila de
+    /// pendências; em nova falha, deixa o evento na fila para a próxima
+    /// chamada.
+    ///
+    /// Funciona em qualquer `mode`: se não houver `audit.pending.jsonl`
+    /// (ex.: `mode="local"`, que nunca cria esse arquivo), simplesmente
+    /// não há nada para tentar e o resultado vem zerado.
+    fn flush_pending(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let pending_path = storage::pending_path_for(&self.file_path);
+        let pending_events = storage::read_events(&pending_path)?;
+
+        let mut flushed = 0usize;
+        let mut still_pending = 0usize;
+
+        for event in &pending_events {
+            let severity = resolve_severity(event.severity.as_deref()).map_err(crate::errors::AuditError::Config)?;
+            match self.send_to_immutablelog(py, event, severity, event.immutable_trail.as_deref()) {
+                Ok(receipt) => {
+                    storage::update_event_receipt(&self.file_path, &event.id, &receipt)?;
+                    storage::remove_event(&pending_path, &event.id)?;
+                    flushed += 1;
+                }
+                Err(_) => {
+                    // Continua pendente — fica na fila para a próxima
+                    // chamada de `flush_pending()` tentar de novo.
+                    still_pending += 1;
+                }
+            }
+        }
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("flushed", flushed)?;
+        dict.set_item("still_pending", still_pending)?;
+        dict.set_item("total", pending_events.len())?;
+        Ok(dict.into())
+    }
+}
+
+/// Métodos auxiliares internos — fora do bloco `#[pymethods]` de
+/// propósito: nada aqui deve ser exposto como método Python de
+/// `AuditLogger`.
+impl AuditLogger {
+    /// Envia `event` ao ImmutableLog (com retry), liberando o GIL
+    /// durante a chamada HTTP bloqueante — sem isso, qualquer outra
+    /// thread Python (ex.: o event loop do FastAPI rodando o
+    /// middleware noutra thread, ou um servidor WSGI multi-thread)
+    /// ficaria travada pela duração inteira da requisição/retry.
+    fn send_to_immutablelog(
+        &self,
+        py: Python<'_>,
+        event: &AuditEvent,
+        severity: &str,
+        immutable_trail: Option<&str>,
+    ) -> PyResult<ImmutableLogReceipt> {
+        let client = self.client.as_ref().ok_or_else(|| {
+            crate::errors::AuditError::Config(format!(
+                "mode='{}' exige um cliente ImmutableLog inicializado (estado inconsistente)",
+                self.mode.as_str()
+            ))
+        })?;
+        let retry_enabled = self.immutablelog.retry_enabled;
+        let max_retries = self.immutablelog.max_retries;
+
+        let result = py.allow_threads(|| {
+            send_with_retry(client, event, severity, immutable_trail, retry_enabled, max_retries)
+        });
+        result.map_err(|err| crate::errors::AuditError::from(err).into())
     }
 }

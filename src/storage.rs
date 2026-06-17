@@ -1,9 +1,30 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::errors::AuditError;
 use crate::event::AuditEvent;
+use crate::immutablelog_receipt::ImmutableLogReceipt;
+
+/// Deriva o caminho do arquivo de eventos pendentes de entrega a partir
+/// do `file_path` configurado. `"./audit.jsonl"` -> `"./audit.pending.jsonl"`,
+/// no mesmo diretório.
+pub fn pending_path_for(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audit".to_string());
+    let extension = path
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+    let pending_name = format!("{stem}.pending{extension}");
+
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(pending_name),
+        _ => PathBuf::from(pending_name),
+    }
+}
 
 /// Acrescenta um evento ao final do arquivo JSONL, criando o arquivo
 /// (e os diretórios pais, se preciso) caso ainda não existam.
@@ -86,6 +107,66 @@ pub fn read_events(path: &Path) -> Result<Vec<AuditEvent>, AuditError> {
     Ok(events)
 }
 
+/// Reescreve o arquivo inteiro com a lista de eventos dada, de forma
+/// atômica (grava num arquivo temporário no mesmo diretório e troca com
+/// `rename`, que é atômico no mesmo filesystem — nunca existe uma janela
+/// onde o arquivo final está parcialmente escrito).
+///
+/// Usada só para atualizar campos de ENVELOPE (`immutablelog`), nunca
+/// para alterar `hash`/`previous_hash`/etc — quem chama é responsável
+/// por isso. `verify()` recalcula o hash a partir do conteúdo, então
+/// uma reescrita que preserve os campos hasheados não invalida a cadeia.
+fn rewrite_events(path: &Path, events: &[AuditEvent]) -> Result<(), AuditError> {
+    let tmp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let mut tmp_file = File::create(&tmp_path).map_err(|err| AuditError::Io(err.to_string()))?;
+    for event in events {
+        let mut line = serde_json::to_string(event).map_err(|err| AuditError::Serialization(err.to_string()))?;
+        line.push('\n');
+        tmp_file.write_all(line.as_bytes()).map_err(|err| AuditError::Io(err.to_string()))?;
+    }
+    tmp_file.flush().map_err(|err| AuditError::Io(err.to_string()))?;
+    drop(tmp_file);
+
+    std::fs::rename(&tmp_path, path).map_err(|err| AuditError::Io(err.to_string()))?;
+    Ok(())
+}
+
+/// Atualiza o campo `immutablelog` do evento com `id == event_id`,
+/// preservando todos os outros campos (incluindo `hash`) exatamente
+/// como estavam.
+pub fn update_event_receipt(
+    path: &Path,
+    event_id: &str,
+    receipt: &ImmutableLogReceipt,
+) -> Result<(), AuditError> {
+    let mut events = read_events(path)?;
+
+    let event = events
+        .iter_mut()
+        .find(|event| event.id == event_id)
+        .ok_or_else(|| AuditError::Io(format!("evento '{event_id}' não encontrado em {path:?}")))?;
+    event.immutablelog = Some(receipt.clone());
+
+    rewrite_events(path, &events)
+}
+
+/// Remove o evento com `id == event_id` do arquivo (usado por
+/// `flush_pending()` para tirar um evento já confirmado da fila de
+/// pendências).
+pub fn remove_event(path: &Path, event_id: &str) -> Result<(), AuditError> {
+    let events: Vec<AuditEvent> = read_events(path)?
+        .into_iter()
+        .filter(|event| event.id != event_id)
+        .collect();
+
+    rewrite_events(path, &events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +192,9 @@ mod tests {
             metadata: json!({"ip": "192.168.0.10"}),
             previous_hash: previous_hash.map(|hash| hash.to_string()),
             hash: "placeholder".to_string(),
+            severity: None,
+            immutable_trail: None,
+            immutablelog: None,
         }
     }
 
@@ -159,6 +243,75 @@ mod tests {
         let result = read_events(&path);
 
         assert!(matches!(result, Err(AuditError::Serialization(ref msg)) if msg.contains("linha 1")));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pending_path_for_inserts_pending_before_the_extension() {
+        assert_eq!(
+            pending_path_for(&PathBuf::from("./audit.jsonl")),
+            PathBuf::from("./audit.pending.jsonl")
+        );
+        assert_eq!(
+            pending_path_for(&PathBuf::from("/var/log/audit.jsonl")),
+            PathBuf::from("/var/log/audit.pending.jsonl")
+        );
+    }
+
+    #[test]
+    fn update_event_receipt_attaches_receipt_without_changing_hash_or_order() {
+        let path = temp_path();
+        let first = sample_event("LOGIN", None);
+        let second = sample_event("LOGOUT", Some(&first.hash));
+        append_event(&path, &first).expect("append não deveria falhar");
+        append_event(&path, &second).expect("append não deveria falhar");
+
+        let receipt = crate::immutablelog_receipt::ImmutableLogReceipt {
+            status: "delivered".to_string(),
+            tx_id: Some("tx_123".to_string()),
+            ..Default::default()
+        };
+        update_event_receipt(&path, &second.id, &receipt).expect("update não deveria falhar");
+
+        let events = read_events(&path).expect("read não deveria falhar");
+        assert_eq!(events.len(), 2);
+        // O primeiro evento (não tocado) continua idêntico.
+        assert_eq!(events[0], first);
+        // O segundo manteve hash/previous_hash/conteúdo — só ganhou o receipt.
+        assert_eq!(events[1].hash, second.hash);
+        assert_eq!(events[1].previous_hash, second.previous_hash);
+        assert_eq!(events[1].action, second.action);
+        assert_eq!(events[1].immutablelog, Some(receipt));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_event_receipt_fails_for_unknown_event_id() {
+        let path = temp_path();
+        append_event(&path, &sample_event("LOGIN", None)).expect("append não deveria falhar");
+
+        let receipt = crate::immutablelog_receipt::ImmutableLogReceipt::pending();
+        let result = update_event_receipt(&path, "evento-inexistente", &receipt);
+
+        assert!(matches!(result, Err(AuditError::Io(_))));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_event_drops_only_the_matching_event() {
+        let path = temp_path();
+        let first = sample_event("LOGIN", None);
+        let second = sample_event("LOGOUT", Some(&first.hash));
+        append_event(&path, &first).expect("append não deveria falhar");
+        append_event(&path, &second).expect("append não deveria falhar");
+
+        remove_event(&path, &first.id).expect("remove não deveria falhar");
+
+        let events = read_events(&path).expect("read não deveria falhar");
+        assert_eq!(events, vec![second]);
 
         let _ = std::fs::remove_file(&path);
     }

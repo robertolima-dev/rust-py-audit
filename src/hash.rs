@@ -94,6 +94,9 @@ mod tests {
             metadata: json!({"ip": "192.168.0.10"}),
             previous_hash: None,
             hash: String::new(),
+            severity: None,
+            immutable_trail: None,
+            immutablelog: None,
         }
     }
 
@@ -134,6 +137,26 @@ mod tests {
         let hash_with_chain = compute_hash(&first).expect("hash não deveria falhar");
 
         assert_ne!(hash_without_chain, hash_with_chain);
+    }
+
+    #[test]
+    fn is_independent_of_the_immutablelog_receipt() {
+        // Garante a regra de integridade do MVP: o receipt remoto é
+        // metadado operacional, anexado DEPOIS do hash já calculado —
+        // recebê-lo (ou atualizá-lo via `flush_pending()`) nunca pode
+        // mudar o hash original do evento.
+        let without_receipt = base_event();
+        let mut with_receipt = base_event();
+        with_receipt.immutablelog = Some(crate::immutablelog_receipt::ImmutableLogReceipt {
+            status: "delivered".to_string(),
+            tx_id: Some("tx_123".to_string()),
+            ..Default::default()
+        });
+
+        let hash_without = compute_hash(&without_receipt).expect("hash não deveria falhar");
+        let hash_with = compute_hash(&with_receipt).expect("hash não deveria falhar");
+
+        assert_eq!(hash_without, hash_with);
     }
 
     #[test]

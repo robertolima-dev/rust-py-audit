@@ -16,6 +16,11 @@ INSTALLED_APPS = [
 RUST_PY_AUDIT_APP_NAME = "billing-django"
 RUST_PY_AUDIT_FILE_PATH = "./audit.jsonl"
 
+# Com ImmutableLog (ver examples/immutablelog_basic.py e o README):
+# RUST_PY_AUDIT_MODE = "hybrid"
+# RUST_PY_AUDIT_IMMUTABLELOG_URL = "https://api.immutablelog.com"
+# RUST_PY_AUDIT_IMMUTABLELOG_API_KEY = "iml_live_xxxxx"
+
 MIDDLEWARE = [
     "rust_py_audit.django.AuditMiddleware",
     "django.middleware.common.CommonMiddleware",
