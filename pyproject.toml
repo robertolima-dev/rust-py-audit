@@ -1,0 +1,61 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rust-py-audit"
+version = "0.1.0"
+description = "Auditoria de eventos rápida e íntegra (hash chain) para apps Python, com core em Rust."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Roberto Lima", email = "robertolima.izphera@gmail.com" }
+]
+keywords = ["audit", "audit-log", "security", "django", "fastapi", "rust", "integrity", "hash-chain"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Logging",
+]
+requires-python = ">=3.10"
+
+# Nenhuma dependência obrigatória em runtime — o core é a extensão nativa
+# compilada do Rust. fastapi/django só são necessários para quem for usar
+# os middlewares (rust_py_audit.fastapi / rust_py_audit.django).
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.100.0", "starlette>=0.27.0"]
+django = ["django>=4.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "httpx>=0.24",
+    "fastapi>=0.100.0",
+    "starlette>=0.27.0",
+    "django>=4.0",
+    "maturin>=1.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/robertolima-dev/rust-py-audit"
+Repository = "https://github.com/robertolima-dev/rust-py-audit"
+
+[tool.maturin]
+# "python-source" diz à maturin que o código Python "de cara" do pacote
+# (o que será empacotado e importado como `rust_py_audit`) mora em
+# python/rust_py_audit, e não junto do Cargo.toml. É o "mixed layout":
+# parte do pacote é Python puro (fastapi.py, django.py, __init__.py),
+# parte é a extensão nativa compilada a partir de src/lib.rs.
+python-source = "python"
+module-name = "rust_py_audit._rust_py_audit"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

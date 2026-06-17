@@ -1,0 +1,55 @@
+[package]
+name = "rust_py_audit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# Nome do arquivo binário gerado (.so / .pyd / .dylib).
+# É esse nome que o Python carrega internamente como extensão nativa.
+name = "rust_py_audit"
+# "cdylib" = biblioteca dinâmica C-compatível, o formato que o CPython
+# sabe carregar como extensão nativa.
+# "rlib" mantém o crate utilizável como dependência Rust normal, o que
+# vamos usar nos testes em Rust (cargo test) mais adiante.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Note que "extension-module" NÃO está aqui dentro — foi movido para a
+# seção [features] abaixo. Motivo: esse feature flag faz o PyO3 deixar
+# de linkar contra libpython (porque o .so vai ser carregado via dlopen
+# pelo próprio interpretador, que já tem esses símbolos). Isso é exatamente
+# o que a maturin precisa, mas é o que faz `cargo build`/`cargo test`
+# comuns falharem no linker ("symbol not found"), porque aí não existe
+# nenhum processo Python carregando o binário. Mantendo "extension-module"
+# como feature ligada por padrão, mas desligável, conseguimos:
+#   - `maturin develop` / `maturin build` -> usa o default, com extension-module
+#   - `cargo test --no-default-features` -> roda os testes Rust linkando
+#     normalmente contra a libpython de desenvolvimento.
+pyo3 = { version = "0.22", features = ["abi3-py310"] }
+
+# serde: framework de (de)serialização. Não serializa nada por si só —
+# ele define os traits `Serialize`/`Deserialize`. O `derive` permite
+# gerar essas implementações automaticamente com #[derive(Serialize)]
+# em vez de escrever o código de serialização manualmente.
+serde = { version = "1", features = ["derive"] }
+# serde_json: implementação concreta de serde para o formato JSON.
+# É o que vai transformar `AuditEvent` em uma linha JSON (JSONL) e
+# também o que vai nos dar `serde_json::Value` para o campo `metadata`
+# livre (já que metadata pode ter qualquer formato).
+serde_json = "1"
+# sha2: implementação de SHA-256 em Rust puro, usada para gerar o hash
+# de cada evento e encadear com o hash anterior.
+sha2 = "0.10"
+# uuid: geração do `id` de cada evento. Usamos a v4 (aleatório) e
+# habilitamos "serde" para poder (de)serializar o Uuid diretamente
+# como string dentro do JSON, sem conversão manual.
+uuid = { version = "1", features = ["v4", "serde"] }
+# time: optei por `time` em vez de `chrono` porque é mais leve, não
+# arrasta uma dependência extra de timezone database por padrão, e tem
+# integração nativa com serde para o formato RFC3339 (ex.:
+# "2026-06-17T10:00:00Z"), que é o formato do campo `timestamp`.
+time = { version = "0.3", features = ["formatting", "parsing", "serde-well-known", "macros"] }
+
+[features]
+extension-module = ["pyo3/extension-module"]
+default = ["extension-module"]
