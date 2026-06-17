@@ -5,6 +5,8 @@
 [![License](https://img.shields.io/pypi/l/rust-py-audit?color=3fb950)](https://github.com/robertolima-dev/rust-py-audit/blob/main/LICENSE)
 [![GitHub](https://img.shields.io/github/stars/robertolima-dev/rust-py-audit?style=flat&color=e8673a)](https://github.com/robertolima-dev/rust-py-audit)
 
+🌐 **[rust-py-audit.vercel.app](https://rust-py-audit.vercel.app/)**
+
 Biblioteca de auditoria de eventos para aplicações Python, com core em Rust.
 
 Registra eventos de auditoria (`quem fez o quê, quando, em qual recurso`) de forma rápida e estruturada, e encadeia cada evento ao anterior com SHA-256 — qualquer edição, remoção ou reordenação posterior do arquivo de log é detectável com `verify()`.
