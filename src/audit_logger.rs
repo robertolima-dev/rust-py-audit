@@ -1,4 +1,6 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -34,6 +36,27 @@ use crate::verifier::verify_chain;
 /// `AuditLogger` (`new()`), e depois mantemos o cache atualizado a cada
 /// `log()` bem-sucedido.
 ///
+/// O `Mutex` em volta de `last_hash` serve a dois propósitos ligados a
+/// concorrência:
+/// 1. Permite que `log()` e `flush_pending()` recebam `&self` (em vez de
+///    `&mut self`). Com `&mut self`, o PyO3 mantém um *borrow* mutável
+///    exclusivo durante TODO o método — e como `log()` libera o GIL
+///    durante a chamada de rede (`allow_threads`), uma segunda thread
+///    (ex.: WSGI multi-thread compartilhando o mesmo logger) que
+///    chamasse `log()` ao mesmo tempo receberia `RuntimeError: Already
+///    borrowed`, perdendo o evento. Com `&self` + `Mutex`, isso não
+///    acontece.
+/// 2. Garante que a leitura do `last_hash`, o cálculo do `previous_hash`
+///    e a atualização do cache aconteçam atomicamente — duas threads
+///    nunca encadeiam dois eventos no MESMO `previous_hash` (o que
+///    bifurcaria a cadeia).
+///
+/// REGRA CRÍTICA: este `Mutex` só pode ser travado com o GIL JÁ LIBERADO
+/// (dentro de `py.allow_threads`). Travar segurando o GIL poderia
+/// causar deadlock com a thread que liberou o GIL durante a rede e ainda
+/// segura o lock. Por isso `log()`/`flush_pending()`/`last_hash()`
+/// envolvem o uso do lock em `allow_threads`.
+///
 /// Limitação consciente do MVP: esse cache assume que só **este**
 /// `AuditLogger` (este processo) escreve no arquivo. Se dois processos
 /// diferentes apontarem para o mesmo `file_path` e chamarem `log()`
@@ -42,11 +65,21 @@ use crate::verifier::verify_chain;
 /// íntegra (cada processo encadeia com o que *ele* sabia ser o último
 /// hash), mas teríamos duas pontas de cadeia em paralelo. Resolver isso
 /// exigiria lock de arquivo entre processos, fora do escopo do MVP.
+///
+/// Limitação específica de `mode="remote"`: como esse modo NÃO grava
+/// JSONL local, `last_hash` vive apenas em memória. Ao recriar o
+/// `AuditLogger` (reinício do processo), `new()` relê `file_path` —
+/// que está vazio em remote puro — e `last_hash` volta a `None`, ou
+/// seja, o `previous_hash` REINICIA a cada restart. A continuidade da
+/// cadeia entre reinícios, nesse modo, depende inteiramente do
+/// ImmutableLog do lado servidor, não do encadeamento local. Quem
+/// precisa de cadeia local contínua entre reinícios deve usar
+/// `mode="hybrid"`.
 #[pyclass]
 pub struct AuditLogger {
     app_name: String,
     file_path: PathBuf,
-    last_hash: Option<String>,
+    last_hash: Mutex<Option<String>>,
     /// Modo de operação (`local`/`remote`/`hybrid`). Por ora só fica
     /// guardado e exposto via getter — `log()` ainda se comporta como
     /// antes (sempre local) independente do valor aqui. O envio remoto
@@ -132,7 +165,7 @@ impl AuditLogger {
         Ok(AuditLogger {
             app_name,
             file_path,
-            last_hash,
+            last_hash: Mutex::new(last_hash),
             mode,
             immutablelog,
             client,
@@ -193,8 +226,11 @@ impl AuditLogger {
     /// Implementação O(1): só devolve o cache em memória (`Option`
     /// clonado), sem tocar no arquivo em disco — diferente de
     /// `verify()`, que releria tudo de propósito.
-    fn last_hash(&self) -> Option<String> {
-        self.last_hash.clone()
+    ///
+    /// O `allow_threads` em volta do lock segue a REGRA CRÍTICA descrita
+    /// na doc da struct: nunca travar o `Mutex` segurando o GIL.
+    fn last_hash(&self, py: Python<'_>) -> Option<String> {
+        py.allow_threads(|| self.lock_last_hash().clone())
     }
 
     /// Registra um novo evento de auditoria.
@@ -216,7 +252,7 @@ impl AuditLogger {
     /// depois disso.
     #[pyo3(signature = (actor_id, action, resource, resource_id, metadata = None, severity = None, immutable_trail = None))]
     fn log(
-        &mut self,
+        &self,
         py: Python<'_>,
         actor_id: String,
         action: String,
@@ -226,107 +262,46 @@ impl AuditLogger {
         severity: Option<String>,
         immutable_trail: Option<String>,
     ) -> PyResult<PyObject> {
+        // A conversão de `metadata` (e a validação de `severity`) precisa
+        // do GIL e é feita ANTES de liberar threads: `python_to_json`
+        // inspeciona objetos Python, e validar cedo faz `log()` falhar
+        // rápido mesmo em `mode="local"`.
         let metadata_value = match metadata {
             Some(value) => python_to_json(&value)?,
             None => serde_json::Value::Object(serde_json::Map::new()),
         };
 
-        // Valida `severity` já aqui (falha rápido), mesmo em
-        // `mode="local"` — se alguém passa um valor, ele precisa ser
-        // válido independente do modo. `resolved_severity` é o valor
-        // efetivo usado na PRIMEIRA tentativa de envio (default "info"
-        // quando `severity` é `None`); `event.severity` guarda só o que
-        // foi passado (ou `None`), para `flush_pending()` reenviar mais
-        // tarde com a mesma classificação original.
+        // `resolved_severity` é o valor efetivo usado na PRIMEIRA
+        // tentativa de envio (default "info" quando `severity` é `None`);
+        // `event.severity` guarda só o que foi passado (ou `None`), para
+        // `flush_pending()` reenviar mais tarde com a mesma classificação.
         let resolved_severity =
             resolve_severity(severity.as_deref()).map_err(crate::errors::AuditError::Config)?;
         let sanitized_trail = sanitize_trail(immutable_trail.as_deref());
 
         // RFC3339 em UTC produz exatamente o formato do exemplo do MVP:
-        // "2026-06-17T10:00:00Z". `map_err` converte o erro de
-        // formatação (praticamente impossível de ocorrer aqui, mas
-        // ainda é um `Result`) em `PyErr`, evitando `.unwrap()`.
+        // "2026-06-17T10:00:00Z".
         let timestamp = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
 
-        // Montamos o evento com `hash` vazio primeiro: o hash só pode
-        // ser calculado depois que todos os OUTROS campos já existem
-        // (Etapa 5 — `compute_hash` ignora o campo `hash` de propósito,
-        // mas ainda precisamos de algum valor para inicializar o
-        // struct).
-        let mut event = AuditEvent {
-            id: Uuid::new_v4().to_string(),
-            timestamp,
-            app_name: self.app_name.clone(),
-            actor_id,
-            action,
-            resource,
-            resource_id,
-            metadata: metadata_value,
-            previous_hash: self.last_hash.clone(),
-            hash: String::new(),
-            // O hash é calculado a partir só dos campos acima (ver
-            // `hash.rs::HashPayload`) e NUNCA depois — o que vier do
-            // ImmutableLog é só metadado operacional, anexado depois,
-            // sem poder alterar essa "impressão digital" do evento.
-            severity,
-            immutable_trail: sanitized_trail,
-            immutablelog: None,
-        };
-
-        event.hash = compute_hash(&event)?;
-
-        match self.mode {
-            AuditMode::Local => {
-                storage::append_event(&self.file_path, &event)?;
-                self.last_hash = Some(event.hash.clone());
-            }
-            AuditMode::Remote => {
-                // Não grava JSONL local neste modo — se o envio falhar,
-                // o erro sobe como exceção Python e `self.last_hash`
-                // continua apontando para o último evento que de fato
-                // foi confirmado pelo ImmutableLog.
-                let receipt = self.send_to_immutablelog(
-                    py,
-                    &event,
-                    resolved_severity,
-                    event.immutable_trail.as_deref(),
-                )?;
-                event.immutablelog = Some(receipt);
-                self.last_hash = Some(event.hash.clone());
-            }
-            AuditMode::Hybrid => {
-                // Salva local PRIMEIRO: mesmo que o processo morra antes
-                // do envio terminar, o evento já está persistido (sem
-                // receipt ainda) — nunca perdemos o registro local por
-                // causa de uma falha de rede.
-                storage::append_event(&self.file_path, &event)?;
-                self.last_hash = Some(event.hash.clone());
-
-                match self.send_to_immutablelog(
-                    py,
-                    &event,
-                    resolved_severity,
-                    event.immutable_trail.as_deref(),
-                ) {
-                    Ok(receipt) => {
-                        event.immutablelog = Some(receipt.clone());
-                        storage::update_event_receipt(&self.file_path, &event.id, &receipt)?;
-                    }
-                    Err(_) => {
-                        // Falha em hybrid NÃO é exceção Python: o evento
-                        // já está seguro localmente, então devolvemos
-                        // status "pending" e deixamos para
-                        // `flush_pending()` tentar de novo depois.
-                        let pending_receipt = ImmutableLogReceipt::pending();
-                        event.immutablelog = Some(pending_receipt.clone());
-                        storage::update_event_receipt(&self.file_path, &event.id, &pending_receipt)?;
-                        storage::append_event(&storage::pending_path_for(&self.file_path), &event)?;
-                    }
-                }
-            }
-        }
+        // Toda a seção crítica (travar `last_hash`, encadear, gravar
+        // local e/ou enviar à rede, atualizar o cache) roda com o GIL
+        // LIBERADO — ver a REGRA CRÍTICA na doc da struct. `append_chained`
+        // é puro Rust, não toca em objetos Python.
+        let event = py.allow_threads(|| {
+            self.append_chained(
+                actor_id,
+                action,
+                resource,
+                resource_id,
+                metadata_value,
+                timestamp,
+                severity,
+                sanitized_trail,
+                resolved_severity,
+            )
+        })?;
 
         event_to_pydict(py, &event)
     }
@@ -375,30 +350,44 @@ impl AuditLogger {
     fn flush_pending(&self, py: Python<'_>) -> PyResult<PyObject> {
         let pending_path = storage::pending_path_for(&self.file_path);
         let pending_events = storage::read_events(&pending_path)?;
+        let total = pending_events.len();
 
-        let mut flushed = 0usize;
-        let mut still_pending = 0usize;
+        // Igual a `log()`: tudo que trava o `Mutex` ou faz rede roda com
+        // o GIL liberado (REGRA CRÍTICA na doc da struct).
+        let (flushed, still_pending) = py.allow_threads(|| -> Result<(usize, usize), crate::errors::AuditError> {
+            // Primeiro a parte cara/lenta (rede), SEM segurar o lock:
+            // acumulamos os receipts entregues e os ids a remover da fila.
+            let mut delivered: HashMap<String, ImmutableLogReceipt> = HashMap::new();
+            let mut flushed_ids: HashSet<String> = HashSet::new();
 
-        for event in &pending_events {
-            let severity = resolve_severity(event.severity.as_deref()).map_err(crate::errors::AuditError::Config)?;
-            match self.send_to_immutablelog(py, event, severity, event.immutable_trail.as_deref()) {
-                Ok(receipt) => {
-                    storage::update_event_receipt(&self.file_path, &event.id, &receipt)?;
-                    storage::remove_event(&pending_path, &event.id)?;
-                    flushed += 1;
+            for event in &pending_events {
+                let severity = resolve_severity(event.severity.as_deref())
+                    .map_err(crate::errors::AuditError::Config)?;
+                if let Ok(receipt) = self.deliver(event, severity, event.immutable_trail.as_deref())
+                {
+                    delivered.insert(event.id.clone(), receipt);
+                    flushed_ids.insert(event.id.clone());
                 }
-                Err(_) => {
-                    // Continua pendente — fica na fila para a próxima
-                    // chamada de `flush_pending()` tentar de novo.
-                    still_pending += 1;
-                }
+                // Em falha o evento simplesmente continua na fila para a
+                // próxima chamada de `flush_pending()` tentar de novo.
             }
-        }
+
+            // Só agora travamos, para a parte que mexe nos arquivos —
+            // serializando contra um `log()` concorrente. As funções em
+            // lote releem os arquivos aqui dentro, então eventos
+            // acrescentados nesse meio-tempo são preservados.
+            let _guard = self.lock_last_hash();
+            storage::update_event_receipts(&self.file_path, &delivered)?;
+            storage::remove_events(&pending_path, &flushed_ids)?;
+
+            let flushed = flushed_ids.len();
+            Ok((flushed, total - flushed))
+        })?;
 
         let dict = PyDict::new_bound(py);
         dict.set_item("flushed", flushed)?;
         dict.set_item("still_pending", still_pending)?;
-        dict.set_item("total", pending_events.len())?;
+        dict.set_item("total", total)?;
         Ok(dict.into())
     }
 }
@@ -407,30 +396,135 @@ impl AuditLogger {
 /// propósito: nada aqui deve ser exposto como método Python de
 /// `AuditLogger`.
 impl AuditLogger {
-    /// Envia `event` ao ImmutableLog (com retry), liberando o GIL
-    /// durante a chamada HTTP bloqueante — sem isso, qualquer outra
-    /// thread Python (ex.: o event loop do FastAPI rodando o
-    /// middleware noutra thread, ou um servidor WSGI multi-thread)
-    /// ficaria travada pela duração inteira da requisição/retry.
-    fn send_to_immutablelog(
+    /// Trava o `Mutex` de `last_hash`, recuperando-se de um eventual
+    /// *poisoning* (que só ocorreria se uma thread tivesse entrado em
+    /// panic segurando o lock — improvável aqui, já que a seção crítica
+    /// não chama `.unwrap()`/`panic!`). Recuperar em vez de propagar o
+    /// panic evita derrubar o processo Python inteiro por causa de um
+    /// lock envenenado.
+    ///
+    /// IMPORTANTE: só chamar com o GIL liberado (ver REGRA CRÍTICA na
+    /// doc da struct).
+    fn lock_last_hash(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.last_hash
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Envia `event` ao ImmutableLog (com retry). Rust puro: NÃO toca no
+    /// GIL nem o libera — quem chama (`append_chained`/`flush_pending`)
+    /// já está dentro de um `allow_threads`, então a chamada HTTP
+    /// bloqueante já roda com o GIL liberado, sem travar outras threads
+    /// Python.
+    fn deliver(
         &self,
-        py: Python<'_>,
         event: &AuditEvent,
         severity: &str,
         immutable_trail: Option<&str>,
-    ) -> PyResult<ImmutableLogReceipt> {
-        let client = self.client.as_ref().ok_or_else(|| {
-            crate::errors::AuditError::Config(format!(
+    ) -> Result<ImmutableLogReceipt, crate::immutablelog_client::ImmutableLogClientError> {
+        use crate::immutablelog_client::ImmutableLogClientError;
+        let client = self.client.as_ref().ok_or_else(|| ImmutableLogClientError::Permanent {
+            status: None,
+            reason: format!(
                 "mode='{}' exige um cliente ImmutableLog inicializado (estado inconsistente)",
                 self.mode.as_str()
-            ))
+            ),
         })?;
-        let retry_enabled = self.immutablelog.retry_enabled;
-        let max_retries = self.immutablelog.max_retries;
 
-        let result = py.allow_threads(|| {
-            send_with_retry(client, event, severity, immutable_trail, retry_enabled, max_retries)
-        });
-        result.map_err(|err| crate::errors::AuditError::from(err).into())
+        send_with_retry(
+            client,
+            event,
+            severity,
+            immutable_trail,
+            self.immutablelog.retry_enabled,
+            self.immutablelog.max_retries,
+        )
+    }
+
+    /// Seção crítica de `log()`, em Rust puro (sem GIL): trava o
+    /// `last_hash`, monta o evento já encadeado, calcula o hash, grava
+    /// local e/ou envia à rede conforme o modo, e atualiza o cache. O
+    /// lock é mantido por toda a operação — inclusive a chamada de rede
+    /// em `remote`/`hybrid` — de propósito: a cadeia de hashes é
+    /// inerentemente sequencial, então serializar `log()` é o
+    /// comportamento correto (impede duas threads de encadearem no mesmo
+    /// `previous_hash`).
+    #[allow(clippy::too_many_arguments)]
+    fn append_chained(
+        &self,
+        actor_id: String,
+        action: String,
+        resource: String,
+        resource_id: String,
+        metadata: serde_json::Value,
+        timestamp: String,
+        severity: Option<String>,
+        immutable_trail: Option<String>,
+        resolved_severity: &str,
+    ) -> Result<AuditEvent, crate::errors::AuditError> {
+        let mut guard = self.lock_last_hash();
+
+        // `hash` começa vazio: só dá para calculá-lo depois que todos os
+        // outros campos existem (`compute_hash` ignora o campo `hash`).
+        let mut event = AuditEvent {
+            id: Uuid::new_v4().to_string(),
+            timestamp,
+            app_name: self.app_name.clone(),
+            actor_id,
+            action,
+            resource,
+            resource_id,
+            metadata,
+            previous_hash: guard.clone(),
+            hash: String::new(),
+            severity,
+            immutable_trail,
+            immutablelog: None,
+        };
+        event.hash = compute_hash(&event)?;
+
+        match self.mode {
+            AuditMode::Local => {
+                storage::append_event(&self.file_path, &event)?;
+                *guard = Some(event.hash.clone());
+            }
+            AuditMode::Remote => {
+                // Não grava JSONL local: se o envio falhar, o erro sobe
+                // como exceção Python e `last_hash` continua apontando
+                // para o último evento que de fato foi confirmado.
+                let receipt = self
+                    .deliver(&event, resolved_severity, event.immutable_trail.as_deref())
+                    .map_err(crate::errors::AuditError::from)?;
+                event.immutablelog = Some(receipt);
+                *guard = Some(event.hash.clone());
+            }
+            AuditMode::Hybrid => {
+                // Salva local PRIMEIRO: mesmo que o processo morra antes
+                // do envio terminar, o evento já está persistido (sem
+                // receipt) — nunca perdemos o registro local por uma
+                // falha de rede.
+                storage::append_event(&self.file_path, &event)?;
+                *guard = Some(event.hash.clone());
+
+                match self.deliver(&event, resolved_severity, event.immutable_trail.as_deref()) {
+                    Ok(receipt) => {
+                        event.immutablelog = Some(receipt.clone());
+                        storage::update_event_receipt(&self.file_path, &event.id, &receipt)?;
+                    }
+                    Err(_) => {
+                        // Falha em hybrid NÃO é exceção Python: o evento
+                        // já está seguro localmente, então devolvemos
+                        // status "pending" e deixamos `flush_pending()`
+                        // tentar de novo depois.
+                        let pending_receipt = ImmutableLogReceipt::pending();
+                        event.immutablelog = Some(pending_receipt.clone());
+                        storage::update_event_receipt(&self.file_path, &event.id, &pending_receipt)?;
+                        storage::append_event(&storage::pending_path_for(&self.file_path), &event)?;
+                    }
+                }
+            }
+        }
+
+        Ok(event)
     }
 }

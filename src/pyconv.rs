@@ -36,8 +36,26 @@ pub fn python_to_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     }
 
     if let Ok(integer) = value.downcast::<PyInt>() {
-        let number: i64 = integer.extract()?;
-        return Ok(serde_json::Value::from(number));
+        // Python tem inteiros de precisão arbitrária; `i64` não cobre,
+        // por exemplo, IDs de 64 bits sem sinal (acima de i64::MAX) ou
+        // timestamps em nanossegundos. Tentamos `i64` primeiro (cobre
+        // negativos), depois `u64` (cobre o resto do range positivo de
+        // 64 bits) e, só então, caímos em `f64` para inteiros ainda
+        // maiores — preservando o valor (com possível perda de precisão
+        // além de 2^53, inevitável em JSON) em vez de estourar
+        // `OverflowError` e derrubar o `log()` inteiro.
+        if let Ok(number) = integer.extract::<i64>() {
+            return Ok(serde_json::Value::from(number));
+        }
+        if let Ok(number) = integer.extract::<u64>() {
+            return Ok(serde_json::Value::from(number));
+        }
+        let number: f64 = integer.extract()?;
+        return serde_json::Number::from_f64(number)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| {
+                PyTypeError::new_err("inteiro grande demais para representar em metadata")
+            });
     }
 
     if let Ok(float) = value.downcast::<PyFloat>() {
@@ -95,6 +113,12 @@ pub fn json_to_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyO
         serde_json::Value::Number(number) => {
             if let Some(integer) = number.as_i64() {
                 Ok(integer.into_py(py))
+            } else if let Some(unsigned) = number.as_u64() {
+                // Inteiros acima de i64::MAX (ex.: IDs de 64 bits sem
+                // sinal) precisam de `as_u64` ANTES de `as_f64`, ou
+                // voltariam como float — quebrando o round-trip exato
+                // do que `python_to_json` gravou como u64.
+                Ok(unsigned.into_py(py))
             } else if let Some(float) = number.as_f64() {
                 Ok(float.into_py(py))
             } else {

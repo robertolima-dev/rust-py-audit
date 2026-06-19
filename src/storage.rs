@@ -167,6 +167,55 @@ pub fn remove_event(path: &Path, event_id: &str) -> Result<(), AuditError> {
     rewrite_events(path, &events)
 }
 
+/// Versão em lote de `update_event_receipt`: anexa o receipt
+/// correspondente a cada evento cujo `id` esteja em `receipts`, numa
+/// ÚNICA leitura + reescrita do arquivo. `flush_pending()` usa isso para
+/// não pagar um O(n) (ler+reescrever o arquivo inteiro) por evento
+/// confirmado — o que tornaria o flush O(n*m) com `m` pendentes.
+///
+/// Relê o arquivo na hora da escrita (em vez de receber a lista pronta)
+/// de propósito: assim eventos gravados concorrentemente por um `log()`
+/// entre o início do flush e este ponto são preservados, não
+/// sobrescritos.
+pub fn update_event_receipts(
+    path: &Path,
+    receipts: &std::collections::HashMap<String, ImmutableLogReceipt>,
+) -> Result<(), AuditError> {
+    if receipts.is_empty() {
+        return Ok(());
+    }
+
+    let mut events = read_events(path)?;
+    for event in events.iter_mut() {
+        if let Some(receipt) = receipts.get(&event.id) {
+            event.immutablelog = Some(receipt.clone());
+        }
+    }
+
+    rewrite_events(path, &events)
+}
+
+/// Versão em lote de `remove_event`: remove todos os eventos cujo `id`
+/// esteja em `ids`, numa única leitura + reescrita. Remover por `id`
+/// (em vez de reescrever a fila com um snapshot antigo) preserva
+/// eventos pendentes que tenham sido acrescentados concorrentemente
+/// durante o flush.
+pub fn remove_events(
+    path: &Path,
+    ids: &std::collections::HashSet<String>,
+) -> Result<(), AuditError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let events: Vec<AuditEvent> = read_events(path)?
+        .into_iter()
+        .filter(|event| !ids.contains(&event.id))
+        .collect();
+
+    rewrite_events(path, &events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +345,73 @@ mod tests {
         let result = update_event_receipt(&path, "evento-inexistente", &receipt);
 
         assert!(matches!(result, Err(AuditError::Io(_))));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_event_receipts_applies_many_in_a_single_rewrite() {
+        let path = temp_path();
+        let first = sample_event("LOGIN", None);
+        let second = sample_event("LOGOUT", Some(&first.hash));
+        let third = sample_event("DELETE", Some(&second.hash));
+        append_event(&path, &first).expect("append não deveria falhar");
+        append_event(&path, &second).expect("append não deveria falhar");
+        append_event(&path, &third).expect("append não deveria falhar");
+
+        let mut receipts = std::collections::HashMap::new();
+        receipts.insert(first.id.clone(), ImmutableLogReceipt::pending());
+        receipts.insert(
+            third.id.clone(),
+            crate::immutablelog_receipt::ImmutableLogReceipt {
+                status: "delivered".to_string(),
+                tx_id: Some("tx_3".to_string()),
+                ..Default::default()
+            },
+        );
+        update_event_receipts(&path, &receipts).expect("update em lote não deveria falhar");
+
+        let events = read_events(&path).expect("read não deveria falhar");
+        assert_eq!(events.len(), 3);
+        // Ordem preservada; só os ids no mapa ganharam receipt.
+        assert_eq!(events[0].immutablelog.as_ref().map(|r| r.status.as_str()), Some("pending"));
+        assert_eq!(events[1].immutablelog, None);
+        assert_eq!(events[2].immutablelog.as_ref().and_then(|r| r.tx_id.clone()), Some("tx_3".to_string()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_events_drops_only_the_matching_ids_in_one_pass() {
+        let path = temp_path();
+        let first = sample_event("LOGIN", None);
+        let second = sample_event("LOGOUT", Some(&first.hash));
+        let third = sample_event("DELETE", Some(&second.hash));
+        append_event(&path, &first).expect("append não deveria falhar");
+        append_event(&path, &second).expect("append não deveria falhar");
+        append_event(&path, &third).expect("append não deveria falhar");
+
+        let mut ids = std::collections::HashSet::new();
+        ids.insert(first.id.clone());
+        ids.insert(third.id.clone());
+        remove_events(&path, &ids).expect("remove em lote não deveria falhar");
+
+        let events = read_events(&path).expect("read não deveria falhar");
+        assert_eq!(events, vec![second]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_helpers_are_noops_when_empty() {
+        let path = temp_path();
+        append_event(&path, &sample_event("LOGIN", None)).expect("append não deveria falhar");
+
+        update_event_receipts(&path, &std::collections::HashMap::new()).expect("noop");
+        remove_events(&path, &std::collections::HashSet::new()).expect("noop");
+
+        let events = read_events(&path).expect("read não deveria falhar");
+        assert_eq!(events.len(), 1);
 
         let _ = std::fs::remove_file(&path);
     }
