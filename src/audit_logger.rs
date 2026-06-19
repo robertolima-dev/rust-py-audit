@@ -354,38 +354,54 @@ impl AuditLogger {
 
         // Igual a `log()`: tudo que trava o `Mutex` ou faz rede roda com
         // o GIL liberado (REGRA CRÍTICA na doc da struct).
-        let (flushed, still_pending) = py.allow_threads(|| -> Result<(usize, usize), crate::errors::AuditError> {
-            // Primeiro a parte cara/lenta (rede), SEM segurar o lock:
-            // acumulamos os receipts entregues e os ids a remover da fila.
-            let mut delivered: HashMap<String, ImmutableLogReceipt> = HashMap::new();
-            let mut flushed_ids: HashSet<String> = HashSet::new();
+        let (flushed, failed, still_pending) =
+            py.allow_threads(|| -> Result<(usize, usize, usize), crate::errors::AuditError> {
+                // Primeiro a parte cara/lenta (rede), SEM segurar o lock:
+                // acumulamos os receipts a gravar e os ids a remover da fila.
+                // `receipts` junta entregues e permanentes-falhados (ambos
+                // saem da fila); `handled` é o conjunto de ids a remover.
+                let mut receipts: HashMap<String, ImmutableLogReceipt> = HashMap::new();
+                let mut handled: HashSet<String> = HashSet::new();
+                let mut flushed = 0usize;
+                let mut failed = 0usize;
 
-            for event in &pending_events {
-                let severity = resolve_severity(event.severity.as_deref())
-                    .map_err(crate::errors::AuditError::Config)?;
-                if let Ok(receipt) = self.deliver(event, severity, event.immutable_trail.as_deref())
-                {
-                    delivered.insert(event.id.clone(), receipt);
-                    flushed_ids.insert(event.id.clone());
+                for event in &pending_events {
+                    let severity = resolve_severity(event.severity.as_deref())
+                        .map_err(crate::errors::AuditError::Config)?;
+                    match self.deliver(event, severity, event.immutable_trail.as_deref()) {
+                        Ok(receipt) => {
+                            receipts.insert(event.id.clone(), receipt);
+                            handled.insert(event.id.clone());
+                            flushed += 1;
+                        }
+                        Err(err) if err.is_retryable() => {
+                            // Transitório: continua na fila para a próxima
+                            // chamada de `flush_pending()` tentar de novo.
+                        }
+                        Err(_) => {
+                            // Permanente: marca `failed` e tira da fila —
+                            // retentar não muda o resultado (#8).
+                            receipts.insert(event.id.clone(), ImmutableLogReceipt::failed());
+                            handled.insert(event.id.clone());
+                            failed += 1;
+                        }
+                    }
                 }
-                // Em falha o evento simplesmente continua na fila para a
-                // próxima chamada de `flush_pending()` tentar de novo.
-            }
 
-            // Só agora travamos, para a parte que mexe nos arquivos —
-            // serializando contra um `log()` concorrente. As funções em
-            // lote releem os arquivos aqui dentro, então eventos
-            // acrescentados nesse meio-tempo são preservados.
-            let _guard = self.lock_last_hash();
-            storage::update_event_receipts(&self.file_path, &delivered)?;
-            storage::remove_events(&pending_path, &flushed_ids)?;
+                // Só agora travamos, para a parte que mexe nos arquivos —
+                // serializando contra um `log()` concorrente. As funções em
+                // lote releem os arquivos aqui dentro, então eventos
+                // acrescentados nesse meio-tempo são preservados.
+                let _guard = self.lock_last_hash();
+                storage::update_event_receipts(&self.file_path, &receipts)?;
+                storage::remove_events(&pending_path, &handled)?;
 
-            let flushed = flushed_ids.len();
-            Ok((flushed, total - flushed))
-        })?;
+                Ok((flushed, failed, total - flushed - failed))
+            })?;
 
         let dict = PyDict::new_bound(py);
         dict.set_item("flushed", flushed)?;
+        dict.set_item("failed", failed)?;
         dict.set_item("still_pending", still_pending)?;
         dict.set_item("total", total)?;
         Ok(dict.into())
@@ -499,29 +515,47 @@ impl AuditLogger {
                 *guard = Some(event.hash.clone());
             }
             AuditMode::Hybrid => {
-                // Salva local PRIMEIRO: mesmo que o processo morra antes
-                // do envio terminar, o evento já está persistido (sem
-                // receipt) — nunca perdemos o registro local por uma
-                // falha de rede.
+                // Entrega ANTES de gravar, para anexar o evento ao JSONL
+                // local UMA única vez (append O(1)) já com o receipt
+                // final — em vez de gravar e depois reescrever o arquivo
+                // inteiro (O(n)) só para anexar o receipt. Falha em hybrid
+                // NUNCA é exceção Python.
+                //
+                // Isso preserva a garantia "uma falha de REDE nunca perde
+                // o registro local": uma falha de rede (timeout, conexão
+                // recusada, 5xx) cai num dos ramos `Err` abaixo, que grava
+                // o evento localmente do mesmo jeito. O único cenário novo
+                // de perda é o processo ser MORTO no meio da chamada de
+                // rede (janela limitada por `timeout_ms`) — e, mesmo aí, se
+                // a entrega chegou ao ImmutableLog o registro existe no
+                // destino remoto (a fonte de verdade no modo hybrid).
+                let (receipt, queue_for_retry) =
+                    match self.deliver(&event, resolved_severity, event.immutable_trail.as_deref()) {
+                        Ok(receipt) => (receipt, false),
+                        Err(err) if err.is_retryable() => {
+                            // Transitório: vira `pending` e entra na fila
+                            // para `flush_pending()` tentar de novo depois.
+                            (ImmutableLogReceipt::pending(), true)
+                        }
+                        Err(_) => {
+                            // Permanente (400/401/403/429/...): retentar não
+                            // muda nada, então `failed` e NÃO enfileira.
+                            (ImmutableLogReceipt::failed(), false)
+                        }
+                    };
+
+                event.immutablelog = Some(receipt);
+
+                // Enfileira ANTES de gravar no arquivo principal: se o
+                // processo morrer entre os dois appends, o evento ainda
+                // está na fila e `flush_pending()` o reentrega — preferível
+                // a ficar gravado como `pending` no arquivo principal sem
+                // estar na fila (preso sem reenvio).
+                if queue_for_retry {
+                    storage::append_event(&storage::pending_path_for(&self.file_path), &event)?;
+                }
                 storage::append_event(&self.file_path, &event)?;
                 *guard = Some(event.hash.clone());
-
-                match self.deliver(&event, resolved_severity, event.immutable_trail.as_deref()) {
-                    Ok(receipt) => {
-                        event.immutablelog = Some(receipt.clone());
-                        storage::update_event_receipt(&self.file_path, &event.id, &receipt)?;
-                    }
-                    Err(_) => {
-                        // Falha em hybrid NÃO é exceção Python: o evento
-                        // já está seguro localmente, então devolvemos
-                        // status "pending" e deixamos `flush_pending()`
-                        // tentar de novo depois.
-                        let pending_receipt = ImmutableLogReceipt::pending();
-                        event.immutablelog = Some(pending_receipt.clone());
-                        storage::update_event_receipt(&self.file_path, &event.id, &pending_receipt)?;
-                        storage::append_event(&storage::pending_path_for(&self.file_path), &event)?;
-                    }
-                }
             }
         }
 

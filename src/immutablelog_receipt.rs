@@ -39,4 +39,16 @@ impl ImmutableLogReceipt {
             ..Default::default()
         }
     }
+
+    /// Entrega abandonada por erro PERMANENTE (400/401/403/429/...):
+    /// diferente de `pending`, um evento `failed` NÃO entra na fila de
+    /// reenvio — retentar não mudaria o resultado, então deixá-lo
+    /// pendente só o prenderia para sempre numa fila que
+    /// `flush_pending()` nunca conseguiria esvaziar.
+    pub fn failed() -> Self {
+        ImmutableLogReceipt {
+            status: "failed".to_string(),
+            ..Default::default()
+        }
+    }
 }

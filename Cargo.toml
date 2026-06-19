@@ -1,6 +1,6 @@
 [package]
 name = "rust_py_audit"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 description = "Auditoria de eventos com cadeia de hashes (SHA-256) para apps Python, core em Rust via PyO3."
 license = "MIT"

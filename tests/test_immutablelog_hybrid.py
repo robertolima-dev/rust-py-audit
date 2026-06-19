@@ -39,9 +39,10 @@ def test_hybrid_does_not_raise_on_remote_failure(tmp_path, immutablelog_server):
     assert event["immutablelog"]["status"] == "pending"
 
 
-def test_hybrid_failure_keeps_local_event_and_queues_pending_file(tmp_path, immutablelog_server):
-    immutablelog_server.set_default_response(401, {"ok": False, "reason": "invalid_api_key"})
-    audit = _audit_logger(tmp_path, immutablelog_server)
+def test_hybrid_retryable_failure_keeps_local_event_and_queues_pending_file(tmp_path, immutablelog_server):
+    # 500 é RETRYABLE: vira "pending" e entra na fila para reenvio.
+    immutablelog_server.set_default_response(500, {"ok": False, "reason": "internal_error"})
+    audit = _audit_logger(tmp_path, immutablelog_server, retry_enabled=False)
 
     event = audit.log(actor_id="user_1", action="DELETE_INVOICE", resource="invoice", resource_id="inv_1")
 
@@ -56,6 +57,30 @@ def test_hybrid_failure_keeps_local_event_and_queues_pending_file(tmp_path, immu
     pending_lines = pending_path.read_text().strip().splitlines()
     assert len(pending_lines) == 1
     assert json.loads(pending_lines[0])["id"] == event["id"]
+
+
+def test_hybrid_permanent_failure_marks_failed_and_does_not_queue(tmp_path, immutablelog_server):
+    # 401 é PERMANENTE (#8): vira "failed" e NÃO entra na fila — retentar
+    # não mudaria o resultado, então não fica preso para sempre.
+    immutablelog_server.set_default_response(401, {"ok": False, "reason": "invalid_api_key"})
+    audit = _audit_logger(tmp_path, immutablelog_server)
+
+    event = audit.log(actor_id="user_1", action="DELETE_INVOICE", resource="invoice", resource_id="inv_1")
+
+    assert event["immutablelog"]["status"] == "failed"
+
+    audit_lines = (tmp_path / "audit.jsonl").read_text().strip().splitlines()
+    assert len(audit_lines) == 1
+    persisted = json.loads(audit_lines[0])
+    assert persisted["hash"] == event["hash"]
+    assert persisted["immutablelog"]["status"] == "failed"
+
+    # Erro permanente não cria/popula a fila de pendências.
+    pending_path = tmp_path / "audit.pending.jsonl"
+    assert not pending_path.exists() or pending_path.read_text().strip() == ""
+
+    # E a cadeia local continua válida (o "failed" é só metadado).
+    assert audit.verify()["valid"] is True
 
 
 def test_hybrid_local_chain_stays_valid_after_failure(tmp_path, immutablelog_server):

@@ -14,7 +14,7 @@ def test_flush_pending_on_empty_queue_is_a_no_op(tmp_path, immutablelog_server):
 
     result = audit.flush_pending()
 
-    assert result == {"flushed": 0, "still_pending": 0, "total": 0}
+    assert result == {"flushed": 0, "failed": 0, "still_pending": 0, "total": 0}
 
 
 def test_flush_pending_retries_and_updates_receipt_on_recovery(tmp_path, immutablelog_server):
@@ -32,7 +32,7 @@ def test_flush_pending_retries_and_updates_receipt_on_recovery(tmp_path, immutab
     assert event["immutablelog"]["status"] == "pending"
 
     still_failing = audit.flush_pending()
-    assert still_failing == {"flushed": 0, "still_pending": 1, "total": 1}
+    assert still_failing == {"flushed": 0, "failed": 0, "still_pending": 1, "total": 1}
 
     immutablelog_server.set_default_response(202, {
         "ok": True,
@@ -43,7 +43,7 @@ def test_flush_pending_retries_and_updates_receipt_on_recovery(tmp_path, immutab
         "request_id": "req_flushed",
     })
     recovered = audit.flush_pending()
-    assert recovered == {"flushed": 1, "still_pending": 0, "total": 1}
+    assert recovered == {"flushed": 1, "failed": 0, "still_pending": 0, "total": 1}
 
     pending_path = tmp_path / "audit.pending.jsonl"
     assert pending_path.read_text().strip() == ""
@@ -123,4 +123,37 @@ def test_flush_pending_without_pending_file_is_a_no_op(tmp_path):
 
     result = audit.flush_pending()
 
-    assert result == {"flushed": 0, "still_pending": 0, "total": 0}
+    assert result == {"flushed": 0, "failed": 0, "still_pending": 0, "total": 0}
+
+
+def test_flush_pending_gives_up_on_permanent_error_and_dequeues(tmp_path, immutablelog_server):
+    # Um evento que ficou "pending" por uma falha transitória (500), mas
+    # cuja causa virou PERMANENTE (401) na hora do flush, precisa sair da
+    # fila marcado como "failed" — em vez de ficar preso para sempre (#8).
+    immutablelog_server.set_default_response(500, {"ok": False, "reason": "internal_error"})
+    audit = AuditLogger(
+        app_name="billing-api",
+        file_path=str(tmp_path / "audit.jsonl"),
+        mode="hybrid",
+        immutablelog_url=immutablelog_server.url,
+        immutablelog_api_key="iml_live_ok",
+        retry_enabled=False,
+    )
+
+    event = audit.log(actor_id="user_1", action="DELETE_INVOICE", resource="invoice", resource_id="inv_1")
+    assert event["immutablelog"]["status"] == "pending"
+
+    immutablelog_server.set_default_response(401, {"ok": False, "reason": "invalid_api_key"})
+    result = audit.flush_pending()
+    assert result == {"flushed": 0, "failed": 1, "still_pending": 0, "total": 1}
+
+    # Saiu da fila e ficou marcado como "failed" no arquivo principal.
+    pending_path = tmp_path / "audit.pending.jsonl"
+    assert pending_path.read_text().strip() == ""
+
+    persisted = json.loads((tmp_path / "audit.jsonl").read_text().strip())
+    assert persisted["immutablelog"]["status"] == "failed"
+    assert persisted["hash"] == event["hash"]
+
+    # Uma nova chamada não tem mais nada para tentar.
+    assert audit.flush_pending() == {"flushed": 0, "failed": 0, "still_pending": 0, "total": 0}

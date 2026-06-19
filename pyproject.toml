@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rust-py-audit"
-version = "0.2.4"
+version = "0.3.0"
 description = "Fast, tamper-evident event auditing (hash chain) for Python apps, with a Rust core."
 readme = "README.md"
 license = "MIT"

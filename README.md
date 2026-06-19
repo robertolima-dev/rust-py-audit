@@ -161,7 +161,7 @@ See the full example in [`examples/django_example/`](examples/django_example/).
 |---|---|---|---|
 | `"local"` (default) | ✅ | ❌ | The library's original behavior, no external dependency |
 | `"remote"` | ❌ (except for pending entries, see below) | ✅ | ImmutableLog is the single source of truth; a delivery failure raises an exception |
-| `"hybrid"` | ✅ | ✅ | Local chain + remote receipt; a delivery failure NEVER raises — it becomes `delivery_status="pending"` |
+| `"hybrid"` | ✅ | ✅ | Local chain + remote receipt; a delivery failure NEVER raises — a transient (retryable) failure becomes `status="pending"` (queued for `flush_pending()`), a permanent one becomes `status="failed"` (not queued) |
 
 `mode="local"` is the default — existing code calling `AuditLogger(app_name, file_path)` keeps working unchanged.
 
@@ -191,11 +191,12 @@ event = audit.log(
 
 print(event["immutablelog"])
 # {"status": "delivered", "tx_id": "tx_...", "payload_hash": "...", ...}
-# or {"status": "pending", "tx_id": None, ...} if delivery failed (hybrid mode)
+# or {"status": "pending", "tx_id": None, ...} on a transient failure (hybrid mode)
+# or {"status": "failed", "tx_id": None, ...} on a permanent failure (hybrid mode)
 
 # Retries delivery of every event still marked "pending":
 print(audit.flush_pending())
-# {"flushed": 1, "still_pending": 0, "total": 1}
+# {"flushed": 1, "failed": 0, "still_pending": 0, "total": 1}
 ```
 
 ### Environment variables
@@ -282,7 +283,11 @@ Same behavior as FastAPI: `severity` computed from `status_code`, and delivery f
 - **Retryable**: `5xx` and timeouts.
 - **Permanent** (never retried): `400`, `401`, `403`, `429`, and any other client error.
 - In `mode="remote"`, exhausting retries (or a permanent error) raises `RuntimeError`.
-- In `mode="hybrid"`, the same scenario marks the event as `delivery_status="pending"`, writes it to `audit.pending.jsonl`, and never raises — call `audit.flush_pending()` (manually, or from a cron/worker) to retry later.
+- In `mode="hybrid"`, delivery never raises:
+  - a **retryable** failure (5xx/timeout) marks the event `status="pending"` and queues it in `audit.pending.jsonl` — call `audit.flush_pending()` (manually, or from a cron/worker) to retry later;
+  - a **permanent** failure (4xx) marks the event `status="failed"` and does **not** queue it (retrying would never succeed, so it stays out of the queue instead of getting stuck there forever). The event is still recorded locally and the chain stays valid — `"failed"` is just operational metadata.
+
+In `mode="hybrid"`, the event is appended to the local JSONL **once**, already carrying its final receipt (an O(1) append per event, not a full-file rewrite). A network failure still records the event locally (as `pending`/`failed`), so it is never lost to a failed delivery; the only loss window is the process being killed mid-request, and even then a delivery that did reach ImmutableLog is preserved in the remote store.
 
 ### Integrity guarantee
 
@@ -334,7 +339,7 @@ Records an event and returns the full event (already with `id`, `timestamp`, `ha
 | `hash` | `str` | SHA-256 (64 hex chars) of the event + `previous_hash` |
 | `severity` | `str \| absent` | Only present if passed to `log()`. Becomes `meta.type` on ImmutableLog |
 | `immutable_trail` | `str \| absent` | Only present if passed to `log()` (and not empty after sanitization). Becomes `meta.immutable_trail` |
-| `immutablelog` | `dict \| absent` | Only present in `mode="remote"`/`"hybrid"`. `status` is `"delivered"` or `"pending"`; other fields (`tx_id`, `payload_hash`, `duplicate`, `request_id`, ...) come from the ImmutableLog response |
+| `immutablelog` | `dict \| absent` | Only present in `mode="remote"`/`"hybrid"`. `status` is `"delivered"`, `"pending"` (transient failure, queued), or `"failed"` (permanent failure, not queued); other fields (`tx_id`, `payload_hash`, `duplicate`, `request_id`, ...) come from the ImmutableLog response |
 
 In `mode="remote"`, a permanent failure or exhausted retries raise `RuntimeError` instead of returning the dict.
 
@@ -357,10 +362,13 @@ Hash of the last recorded event (in-memory cache, O(1)) — `None` if no event h
 Attempts to redeliver to ImmutableLog every event marked as `pending` (recorded in `audit.pending.jsonl`, derived from `file_path`). Only relevant in `mode="hybrid"` — other modes never populate this queue.
 
 ```python
-{"flushed": 1, "still_pending": 0, "total": 1}
+{"flushed": 1, "failed": 0, "still_pending": 0, "total": 1}
 ```
 
-On success, updates `event["immutablelog"]` in `audit.jsonl` (without changing `hash`) and removes the event from the queue. Events that fail again stay in the queue for the next call.
+For each queued event:
+- **delivered** → updates `event["immutablelog"]` in `audit.jsonl` to `"delivered"` (without changing `hash`) and removes it from the queue (counts toward `flushed`);
+- **permanent failure** → marks it `"failed"` in `audit.jsonl` and removes it from the queue, so it doesn't stay stuck forever (counts toward `failed`);
+- **retryable failure** → left in the queue for the next call (counts toward `still_pending`).
 
 ---
 
