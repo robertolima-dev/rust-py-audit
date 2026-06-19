@@ -18,6 +18,7 @@ Records audit events (`who did what, when, on which resource`) in a fast, struct
 - **`AuditLogger`** — simple API: `log(...)`, `verify()`, `last_hash()`
 - **Hash chain (SHA-256)** — each event embeds the hash of the previous event; altering any recorded event breaks the chain in a detectable way
 - **JSONL storage** — one event per line, append-only, no database required
+- **Thread-safe** — a single `AuditLogger` can be shared across threads (e.g. a multi-threaded WSGI server, or one middleware instance serving concurrent requests); the hash chain stays linear under concurrency
 - **Free-form `metadata`** — any JSON-serializable `dict` (IP, reason, request_id, etc.)
 - **FastAPI middleware** — automatically logs state-changing requests (POST/PUT/PATCH/DELETE)
 - **Django middleware** — same idea, supports WSGI and ASGI
