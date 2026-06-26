@@ -372,6 +372,16 @@ For each queued event:
 
 ---
 
+## Roadmap
+
+`rust-py-audit` is mature (v0.3.0): the SHA-256 hash chain, JSONL storage,
+FastAPI/Django middlewares, and the ImmutableLog `local`/`remote`/`hybrid`
+integration are shipped and stable. Directional ideas under consideration (log
+rotation, incremental verification, more delivery backends, an async client, a
+Flask middleware) are tracked in [ROADMAP.md](./ROADMAP.md).
+
+---
+
 ## Building from Source
 
 Requires Rust and [maturin](https://github.com/PyO3/maturin).
