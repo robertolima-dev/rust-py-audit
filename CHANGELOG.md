@@ -5,6 +5,33 @@ Todas as mudanças relevantes deste projeto são registradas aqui.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e o versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.3.3] — não publicada
+
+Correção do passo de verificação pós-upload introduzido na 0.3.2.
+
+### Corrigido
+
+- **Falso negativo na verificação pós-publicação.** O passo comparava
+  `glob("dist/*")` com o que estava no PyPI. Nada quebrou aqui — o
+  `maturin upload` não deixa arquivo extra em `dist/` —, mas o glob amplo é
+  frágil: qualquer arquivo novo no diretório reprovaria uma release que deu
+  certo, que foi exatamente o que aconteceu no `rust_py_rate_limit`. O passo
+  agora só considera `*.whl` e `*.tar.gz`, os únicos tipos de arquivo que o
+  PyPI hospeda.
+
+- **Os testes passam a rodar em push e PR.** O `release.yml` é o único workflow
+  destes repositórios e só disparava em tag, então o job `test` só rodava na
+  hora do release — protegia a publicação, mas só avisava do problema no pior
+  momento. Agora o workflow também dispara em `push` para `main` e em
+  `pull_request`, e os jobs de build e o de publicação ganharam
+  `if: startsWith(github.ref, 'refs/tags/')`. Essa guarda corrige um risco que
+  existia antes: o job de release **não tinha `if:`**, então um
+  `workflow_dispatch` manual a partir de um branch teria publicado no PyPI.
+
+**Não vai ao PyPI sozinha:** a 0.3.2 está lá completa e esta versão só
+mexe no pipeline. O número fica reservado e sai com a próxima mudança que
+valha uma tag.
+
 ## [0.3.2] - 2026-08-11
 
 Release de infraestrutura: nada muda no comportamento da biblioteca.
