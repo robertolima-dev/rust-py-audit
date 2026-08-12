@@ -54,10 +54,16 @@ impl std::fmt::Display for ImmutableLogClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ImmutableLogClientError::Permanent { status, reason } => {
-                write!(f, "ImmutableLog rejeitou o evento (status={status:?}): {reason}")
+                write!(
+                    f,
+                    "ImmutableLog rejeitou o evento (status={status:?}): {reason}"
+                )
             }
             ImmutableLogClientError::Retryable { status, reason } => {
-                write!(f, "falha ao contatar o ImmutableLog (status={status:?}): {reason}")
+                write!(
+                    f,
+                    "falha ao contatar o ImmutableLog (status={status:?}): {reason}"
+                )
             }
         }
     }
@@ -79,9 +85,13 @@ pub const ALLOWED_SEVERITIES: [&str; 4] = ["error", "warning", "info", "success"
 pub fn resolve_severity(severity: Option<&str>) -> Result<&'static str, String> {
     match severity {
         None => Ok("info"),
-        Some(value) => ALLOWED_SEVERITIES.iter().find(|allowed| **allowed == value).copied().ok_or_else(|| {
-            format!("severity inválida: '{value}' (use uma de {ALLOWED_SEVERITIES:?})")
-        }),
+        Some(value) => ALLOWED_SEVERITIES
+            .iter()
+            .find(|allowed| **allowed == value)
+            .copied()
+            .ok_or_else(|| {
+                format!("severity inválida: '{value}' (use uma de {ALLOWED_SEVERITIES:?})")
+            }),
     }
 }
 
@@ -146,14 +156,20 @@ pub struct ImmutableLogClient {
 
 impl ImmutableLogClient {
     pub fn new(config: &ImmutableLogConfig) -> Result<Self, ImmutableLogClientError> {
-        let base_url = config.url.clone().ok_or_else(|| ImmutableLogClientError::Permanent {
-            status: None,
-            reason: "immutablelog_url não configurado".to_string(),
-        })?;
-        let api_key = config.api_key.clone().ok_or_else(|| ImmutableLogClientError::Permanent {
-            status: None,
-            reason: "immutablelog_api_key não configurado".to_string(),
-        })?;
+        let base_url = config
+            .url
+            .clone()
+            .ok_or_else(|| ImmutableLogClientError::Permanent {
+                status: None,
+                reason: "immutablelog_url não configurado".to_string(),
+            })?;
+        let api_key = config
+            .api_key
+            .clone()
+            .ok_or_else(|| ImmutableLogClientError::Permanent {
+                status: None,
+                reason: "immutablelog_api_key não configurado".to_string(),
+            })?;
 
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
@@ -163,7 +179,12 @@ impl ImmutableLogClient {
                 reason: format!("falha ao montar cliente HTTP: {err}"),
             })?;
 
-        Ok(ImmutableLogClient { http, base_url, api_key, env: config.env.clone() })
+        Ok(ImmutableLogClient {
+            http,
+            base_url,
+            api_key,
+            env: config.env.clone(),
+        })
     }
 
     /// Envia um evento já com hash local calculado. `event.immutablelog`
@@ -182,10 +203,11 @@ impl ImmutableLogClient {
         severity: &str,
         immutable_trail: Option<&str>,
     ) -> Result<ImmutableLogReceipt, ImmutableLogClientError> {
-        let payload = serde_json::to_string(event).map_err(|err| ImmutableLogClientError::Permanent {
-            status: None,
-            reason: format!("falha ao serializar evento para envio: {err}"),
-        })?;
+        let payload =
+            serde_json::to_string(event).map_err(|err| ImmutableLogClientError::Permanent {
+                status: None,
+                reason: format!("falha ao serializar evento para envio: {err}"),
+            })?;
 
         let endpoint = format!("{}/v1/events", self.base_url.trim_end_matches('/'));
         let request_id = Uuid::new_v4().to_string();
@@ -224,10 +246,13 @@ impl ImmutableLogClient {
         let status = response.status();
 
         if status.is_success() {
-            let parsed: IngestResponse = response.json().map_err(|err| ImmutableLogClientError::Retryable {
-                status: Some(status.as_u16()),
-                reason: format!("resposta inesperada do ImmutableLog: {err}"),
-            })?;
+            let parsed: IngestResponse =
+                response
+                    .json()
+                    .map_err(|err| ImmutableLogClientError::Retryable {
+                        status: Some(status.as_u16()),
+                        reason: format!("resposta inesperada do ImmutableLog: {err}"),
+                    })?;
 
             return Ok(ImmutableLogReceipt {
                 status: "delivered".to_string(),
@@ -251,9 +276,15 @@ impl ImmutableLogClient {
             .unwrap_or_else(|| format!("HTTP {status_code}"));
 
         if status.is_server_error() {
-            Err(ImmutableLogClientError::Retryable { status: Some(status_code), reason })
+            Err(ImmutableLogClientError::Retryable {
+                status: Some(status_code),
+                reason,
+            })
         } else {
-            Err(ImmutableLogClientError::Permanent { status: Some(status_code), reason })
+            Err(ImmutableLogClientError::Permanent {
+                status: Some(status_code),
+                reason,
+            })
         }
     }
 }
@@ -315,7 +346,9 @@ mod tests {
             }));
         });
 
-        let receipt = client_for(&server).send(&event, "info", None).expect("envio deveria ter sucesso");
+        let receipt = client_for(&server)
+            .send(&event, "info", None)
+            .expect("envio deveria ter sucesso");
 
         mock.assert();
         assert_eq!(receipt.status, "delivered");
@@ -331,7 +364,8 @@ mod tests {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/events");
-            then.status(401).json_body(json!({"ok": false, "reason": "invalid_api_key"}));
+            then.status(401)
+                .json_body(json!({"ok": false, "reason": "invalid_api_key"}));
         });
 
         let result = client_for(&server).send(&sample_event(), "info", None);
@@ -351,12 +385,16 @@ mod tests {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(POST).path("/v1/events");
-            then.status(400).json_body(json!({"ok": false, "reason": "invalid_payload"}));
+            then.status(400)
+                .json_body(json!({"ok": false, "reason": "invalid_payload"}));
         });
 
         let result = client_for(&server).send(&sample_event(), "info", None);
 
-        assert!(matches!(result, Err(ImmutableLogClientError::Permanent { .. })));
+        assert!(matches!(
+            result,
+            Err(ImmutableLogClientError::Permanent { .. })
+        ));
     }
 
     #[test]
@@ -364,7 +402,8 @@ mod tests {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/events");
-            then.status(500).json_body(json!({"ok": false, "reason": "internal_error"}));
+            then.status(500)
+                .json_body(json!({"ok": false, "reason": "internal_error"}));
         });
 
         let result = client_for(&server).send(&sample_event(), "info", None);
@@ -388,7 +427,10 @@ mod tests {
 
         let result = client_for(&server).send(&sample_event(), "info", None);
 
-        assert!(matches!(result, Err(ImmutableLogClientError::Permanent { .. })));
+        assert!(matches!(
+            result,
+            Err(ImmutableLogClientError::Permanent { .. })
+        ));
     }
 
     #[test]
@@ -411,12 +453,18 @@ mod tests {
 
     #[test]
     fn sanitize_trail_passes_through_a_clean_value() {
-        assert_eq!(sanitize_trail(Some("order-2026-00441")), Some("order-2026-00441".to_string()));
+        assert_eq!(
+            sanitize_trail(Some("order-2026-00441")),
+            Some("order-2026-00441".to_string())
+        );
     }
 
     #[test]
     fn sanitize_trail_trims_and_replaces_colons() {
-        assert_eq!(sanitize_trail(Some("  order:2026:00441  ")), Some("order-2026-00441".to_string()));
+        assert_eq!(
+            sanitize_trail(Some("  order:2026:00441  ")),
+            Some("order-2026-00441".to_string())
+        );
     }
 
     #[test]
@@ -466,7 +514,9 @@ mod tests {
             }));
         });
 
-        client.send(&sample_event(), "error", Some("order-42")).expect("envio deveria ter sucesso");
+        client
+            .send(&sample_event(), "error", Some("order-42"))
+            .expect("envio deveria ter sucesso");
 
         mock.assert();
     }
@@ -476,7 +526,8 @@ mod tests {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/events").matches(|req| {
-                let body: serde_json::Value = serde_json::from_slice(req.body.as_deref().unwrap_or(&[])).unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body.as_deref().unwrap_or(&[])).unwrap();
                 let meta = &body["meta"];
                 meta.get("env").is_none() && meta.get("immutable_trail").is_none()
             });
@@ -490,7 +541,9 @@ mod tests {
             }));
         });
 
-        client_for(&server).send(&sample_event(), "info", None).expect("envio deveria ter sucesso");
+        client_for(&server)
+            .send(&sample_event(), "info", None)
+            .expect("envio deveria ter sucesso");
 
         mock.assert();
     }

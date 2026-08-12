@@ -1,0 +1,11 @@
+# Configuração compartilhada do clippy para os cinco `rust_py_*`.
+#
+# O padrão do clippy para `too_many_arguments` é 7. Estes projetos expõem
+# construtores PyO3 que espelham a assinatura Python — `add_job()` do
+# scheduler leva 8 parâmetros porque a API pública leva 8 (retry_backoff,
+# timeout, max_instances e afins). Reagrupar em struct para agradar o lint
+# pioraria a API do lado Python, que é a que o usuário vê.
+#
+# O teto sobe para 10 em vez de o lint ser desligado: acima de 10 o aviso
+# volta a ser informação útil.
+too-many-arguments-threshold = 10

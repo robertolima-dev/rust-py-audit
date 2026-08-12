@@ -64,9 +64,7 @@ impl From<AuditError> for pyo3::PyErr {
             // Erro de serialização -> ValueError: o problema é o
             // *conteúdo* do evento (não serializável ou JSON inválido),
             // categoria de erro que o Python já reconhece bem.
-            AuditError::Serialization(message) => {
-                pyo3::exceptions::PyValueError::new_err(message)
-            }
+            AuditError::Serialization(message) => pyo3::exceptions::PyValueError::new_err(message),
             // Erro de I/O -> OSError: o mesmo tipo de exceção que o
             // próprio Python levanta para problemas de arquivo/disco
             // (`open()`, por exemplo), então o comportamento já é

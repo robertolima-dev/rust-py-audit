@@ -55,7 +55,8 @@ pub fn append_event(path: &Path, event: &AuditEvent) -> Result<(), AuditError> {
         .open(path)
         .map_err(|err| AuditError::Io(err.to_string()))?;
 
-    let mut line = serde_json::to_string(event).map_err(|err| AuditError::Serialization(err.to_string()))?;
+    let mut line =
+        serde_json::to_string(event).map_err(|err| AuditError::Serialization(err.to_string()))?;
     line.push('\n');
 
     file.write_all(line.as_bytes())
@@ -64,7 +65,8 @@ pub fn append_event(path: &Path, event: &AuditEvent) -> Result<(), AuditError> {
     // sistema operacional antes de devolvermos `Ok`. Isso reduz (mas
     // não elimina 100%, sem fsync) a chance de perder o evento se o
     // processo Python morrer logo após o `log()` retornar.
-    file.flush().map_err(|err| AuditError::Io(err.to_string()))?;
+    file.flush()
+        .map_err(|err| AuditError::Io(err.to_string()))?;
 
     Ok(())
 }
@@ -119,17 +121,24 @@ pub fn read_events(path: &Path) -> Result<Vec<AuditEvent>, AuditError> {
 fn rewrite_events(path: &Path, events: &[AuditEvent]) -> Result<(), AuditError> {
     let tmp_path = path.with_file_name(format!(
         ".{}.{}.tmp",
-        path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         uuid::Uuid::new_v4()
     ));
 
     let mut tmp_file = File::create(&tmp_path).map_err(|err| AuditError::Io(err.to_string()))?;
     for event in events {
-        let mut line = serde_json::to_string(event).map_err(|err| AuditError::Serialization(err.to_string()))?;
+        let mut line = serde_json::to_string(event)
+            .map_err(|err| AuditError::Serialization(err.to_string()))?;
         line.push('\n');
-        tmp_file.write_all(line.as_bytes()).map_err(|err| AuditError::Io(err.to_string()))?;
+        tmp_file
+            .write_all(line.as_bytes())
+            .map_err(|err| AuditError::Io(err.to_string()))?;
     }
-    tmp_file.flush().map_err(|err| AuditError::Io(err.to_string()))?;
+    tmp_file
+        .flush()
+        .map_err(|err| AuditError::Io(err.to_string()))?;
     drop(tmp_file);
 
     std::fs::rename(&tmp_path, path).map_err(|err| AuditError::Io(err.to_string()))?;
@@ -287,11 +296,14 @@ mod tests {
     #[test]
     fn read_events_reports_line_number_on_corrupted_line() {
         let path = temp_path();
-        std::fs::write(&path, "{\"not\": \"a valid audit event\"}\n").expect("write deveria funcionar");
+        std::fs::write(&path, "{\"not\": \"a valid audit event\"}\n")
+            .expect("write deveria funcionar");
 
         let result = read_events(&path);
 
-        assert!(matches!(result, Err(AuditError::Serialization(ref msg)) if msg.contains("linha 1")));
+        assert!(
+            matches!(result, Err(AuditError::Serialization(ref msg)) if msg.contains("linha 1"))
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -374,9 +386,18 @@ mod tests {
         let events = read_events(&path).expect("read não deveria falhar");
         assert_eq!(events.len(), 3);
         // Ordem preservada; só os ids no mapa ganharam receipt.
-        assert_eq!(events[0].immutablelog.as_ref().map(|r| r.status.as_str()), Some("pending"));
+        assert_eq!(
+            events[0].immutablelog.as_ref().map(|r| r.status.as_str()),
+            Some("pending")
+        );
         assert_eq!(events[1].immutablelog, None);
-        assert_eq!(events[2].immutablelog.as_ref().and_then(|r| r.tx_id.clone()), Some("tx_3".to_string()));
+        assert_eq!(
+            events[2]
+                .immutablelog
+                .as_ref()
+                .and_then(|r| r.tx_id.clone()),
+            Some("tx_3".to_string())
+        );
 
         let _ = std::fs::remove_file(&path);
     }

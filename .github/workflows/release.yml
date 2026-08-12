@@ -1,8 +1,14 @@
 name: CI / Release
 
-# Push e PR rodam o job `test` e param por aí. Só uma tag `v*` libera os jobs
-# de build e a publicação — cada um deles guardado por `if:` além do gatilho,
-# para que um `workflow_dispatch` a partir de um branch não publique nada.
+# Push e PR rodam `lint` + `test` e param por aí. Os jobs de build são
+# liberados por uma tag `v*` ou por um `workflow_dispatch` manual — o segundo
+# existe para o ensaio no TestPyPI, abaixo.
+#
+# **Só a tag publica no PyPI de produção.** O job `release` é o único guardado
+# apenas por `startsWith(github.ref, 'refs/tags/')`, sem a cláusula de
+# dispatch: um disparo manual constrói tudo e vai para o TestPyPI, nunca para
+# o índice de verdade. Publicação no PyPI não se desfaz, então essa assimetria
+# é proposital.
 on:
   push:
     branches: [main]
@@ -15,6 +21,30 @@ permissions:
   contents: read
 
 jobs:
+  # O lint faz parte do portão de release, não de um workflow paralelo.
+  # Nos repositórios de workflow único, um `lint` vermelho ao lado de uma
+  # publicação bem-sucedida seria ruído difícil de ler — a leitura passa a ser
+  # inequívoca: vermelho significa que não publicou.
+  #
+  # A toolchain é fixa, não "stable": com `-D warnings`, um clippy mais novo
+  # no runner reprova código que ninguém tocou, e a CI ficaria vermelha por
+  # conta do calendário. Subir este número vira uma mudança deliberada.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      # clippy só checa tipos, não linka, então --all-features é seguro aqui
+      # (diferente do `cargo test`, que precisa de --no-default-features).
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   # Nothing gets built, and nothing reaches PyPI, until this passes. Publishing
   # to PyPI is irreversible: a bad wheel cannot be replaced, only yanked.
   test:
@@ -47,8 +77,8 @@ jobs:
 
   linux:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [test, lint]
     strategy:
       matrix:
         target: [x86_64, aarch64]
@@ -75,8 +105,8 @@ jobs:
 
   musllinux:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [test, lint]
     strategy:
       matrix:
         target: [x86_64, aarch64]
@@ -94,8 +124,8 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [test, lint]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -112,8 +142,8 @@ jobs:
 
   macos:
     runs-on: macos-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [test, lint]
     strategy:
       matrix:
         target: [x86_64, aarch64]
@@ -130,8 +160,8 @@ jobs:
 
   sdist:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [test, lint]
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
@@ -143,11 +173,59 @@ jobs:
           name: wheels-sdist
           path: dist
 
+  # Ensaio da troca OIDC, sem tocar no índice de produção. É o que permite
+  # descobrir um publisher mal cadastrado num lugar onde nada é irreversível —
+  # no PyPI, um nome de arquivo publicado nunca pode ser reusado.
+  #
+  # ⚠️ Precisa do seu próprio publisher, cadastrado no TestPyPI (que é uma
+  # conta separada do PyPI), com owner/repo, workflow `release.yml` e
+  # environment `testpypi`.
+  #
+  # Não há verificação pós-upload aqui de propósito: o que se está validando é
+  # a troca de token, e o TestPyPI expira distribuições — reprovar por um
+  # arquivo que o índice de teste descartou seria alarme falso.
+  publish-testpypi:
+    name: Publish to TestPyPI (ensaio)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: [lint, test, linux, musllinux, windows, macos, sdist]
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          skip-existing: true
+
   release:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [test, linux, musllinux, windows, macos, sdist]
+    needs: [lint, test, linux, musllinux, windows, macos, sdist]
+
+    # Trusted publishing (OIDC). Não existe mais `secrets.PYPI_API_TOKEN` aqui:
+    # o GitHub emite um JWT curto afirmando repositório, workflow e ref, e o
+    # PyPI o troca por um token de upload válido por poucos minutos e só para
+    # este projeto. Some o segredo de longa duração que, se vazasse, publicaria
+    # até alguém revogá-lo à mão.
+    #
+    # ⚠️ Os três valores abaixo precisam bater EXATAMENTE com o publisher
+    # cadastrado em PyPI → Manage → Publishing:
+    #   owner/repo .... robertolima-dev/rust-py-audit
+    #   workflow ...... release.yml   (o nome deste arquivo)
+    #   environment ... pypi
+    # Divergência em qualquer um deles é rejeitada na troca do token.
+    environment: pypi
+    permissions:
+      id-token: write
+
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -157,8 +235,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install maturin
-        run: python -m pip install --upgrade maturin requests
+      # `requests` é só para a verificação pós-upload, mais abaixo. A maturin
+      # não é mais instalada aqui: quem publica agora é a action oficial do
+      # PyPA, que é a que sabe fazer a troca OIDC.
+      - name: Install the verification dependency
+        run: python -m pip install --upgrade requests
 
       # A sanity check before anything leaves the runner: publishing an
       # incomplete set is worse than not publishing, because PyPI never lets a
@@ -175,20 +256,33 @@ jobs:
           test "$wheels" -ge 7 \
             || { echo "::error::só $wheels wheels; esperado >= 7 (2 linux, 2 musl, 1 win, 2 macos)"; exit 1; }
 
-      # PyPI returns a transient 500 often enough to matter, and the upload is
-      # file-by-file: a failure halfway leaves the version published in part.
-      # --skip-existing makes the retry idempotent (already-uploaded files are
-      # skipped by name), so a second attempt finishes the job instead of
-      # failing on the files that did make it.
-      - name: Publish to PyPI (with retry)
-        uses: nick-fields/retry@v3
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      # O PyPI devolve 500 transitório com frequência suficiente para importar,
+      # e o upload é arquivo por arquivo: uma falha no meio deixa a versão
+      # publicada pela metade. `skip-existing` é o que torna a segunda
+      # tentativa segura — sem ele, ela morre nos arquivos que já subiram.
+      #
+      # São dois passos explícitos em vez de um wrapper de retry porque o
+      # trusted publishing exige a action oficial, e ela não dá para acionar
+      # por linha de comando de dentro do `nick-fields/retry`. Mesma forma que
+      # o `rust_py_cache` e o `rust_py_rate_limit` já rodam.
+      - name: Publish to PyPI (attempt 1)
+        id: publish1
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          timeout_minutes: 15
-          max_attempts: 4
-          retry_wait_seconds: 45
-          command: maturin upload --non-interactive --skip-existing dist/*
+          packages-dir: dist
+          skip-existing: true
+
+      - name: Wait before retrying
+        if: steps.publish1.outcome == 'failure'
+        run: sleep 45
+
+      - name: Publish to PyPI (attempt 2)
+        if: steps.publish1.outcome == 'failure'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
 
       # Proves the release is actually complete, rather than trusting an exit
       # code that a partial upload can still produce.
@@ -203,6 +297,12 @@ jobs:
           # distribuição em dist/ depois de publicar (atestados PEP 740, que
           # sobem junto do arquivo, não como arquivo próprio). Um glob amplo os
           # conta como "faltando no PyPI" e reprova uma release que deu certo.
+          #
+          # ⚠️ Isto deixou de ser precaução e passou a valer aqui: com trusted
+          # publishing a action gera os atestados, coisa que o `maturin upload`
+          # não fazia. O recorte veio do alarme falso da rate_limit 0.2.1
+          # (P1-9) e é o que impede esta migração de reprovar o primeiro
+          # release por um motivo inventado.
           local = {
               os.path.basename(p)
               for pattern in ("dist/*.whl", "dist/*.tar.gz")

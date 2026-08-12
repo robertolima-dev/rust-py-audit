@@ -68,8 +68,8 @@ pub fn compute_hash(event: &AuditEvent) -> Result<String, AuditError> {
     // `to_vec` em vez de `to_string` para gerar bytes diretamente — o
     // SHA-256 trabalha sobre bytes, então evitamos um passo extra de
     // converter String -> &[u8].
-    let canonical_bytes = serde_json::to_vec(&payload)
-        .map_err(|err| AuditError::Serialization(err.to_string()))?;
+    let canonical_bytes =
+        serde_json::to_vec(&payload).map_err(|err| AuditError::Serialization(err.to_string()))?;
 
     let digest = Sha256::digest(&canonical_bytes);
     // "{:x}" formata os bytes do digest como hexadecimal minúsculo,

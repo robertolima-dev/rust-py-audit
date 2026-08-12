@@ -89,12 +89,16 @@ mod tests {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/events");
-            then.status(401).json_body(json!({"ok": false, "reason": "invalid_api_key"}));
+            then.status(401)
+                .json_body(json!({"ok": false, "reason": "invalid_api_key"}));
         });
 
         let result = send_with_retry(&client_for(&server), &sample_event(), "info", None, true, 3);
 
-        assert!(matches!(result, Err(ImmutableLogClientError::Permanent { .. })));
+        assert!(matches!(
+            result,
+            Err(ImmutableLogClientError::Permanent { .. })
+        ));
         mock.assert_hits(1);
     }
 
@@ -103,12 +107,16 @@ mod tests {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/events");
-            then.status(500).json_body(json!({"ok": false, "reason": "internal_error"}));
+            then.status(500)
+                .json_body(json!({"ok": false, "reason": "internal_error"}));
         });
 
         let result = send_with_retry(&client_for(&server), &sample_event(), "info", None, true, 2);
 
-        assert!(matches!(result, Err(ImmutableLogClientError::Retryable { .. })));
+        assert!(matches!(
+            result,
+            Err(ImmutableLogClientError::Retryable { .. })
+        ));
         // 1 tentativa inicial + 2 retries = 3 chamadas HTTP no total.
         mock.assert_hits(3);
     }
@@ -118,10 +126,18 @@ mod tests {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/events");
-            then.status(500).json_body(json!({"ok": false, "reason": "internal_error"}));
+            then.status(500)
+                .json_body(json!({"ok": false, "reason": "internal_error"}));
         });
 
-        let result = send_with_retry(&client_for(&server), &sample_event(), "info", None, false, 5);
+        let result = send_with_retry(
+            &client_for(&server),
+            &sample_event(),
+            "info",
+            None,
+            false,
+            5,
+        );
 
         assert!(result.is_err());
         mock.assert_hits(1);
@@ -136,7 +152,8 @@ mod tests {
             when.method(POST)
                 .path("/v1/events")
                 .header("Idempotency-Key", "evt_retry");
-            then.status(500).json_body(json!({"ok": false, "reason": "internal_error"}));
+            then.status(500)
+                .json_body(json!({"ok": false, "reason": "internal_error"}));
         });
 
         let result = send_with_retry(&client_for(&server), &sample_event(), "info", None, true, 1);

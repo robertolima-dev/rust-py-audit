@@ -1,3 +1,17 @@
+// Falso positivo do clippy contra a macro do pyo3 0.22, e o `allow` precisa
+// ser de módulo: o lint aponta o *tipo de retorno* de `log`, `verify` e
+// `flush_pending`, mas a conversão está no código que `#[pymethods]` gera —
+// fora do `impl`, onde nem `#[allow]` no bloco nem na função alcançam
+// (ambos testados em 12/08/2026, nenhum silencia).
+//
+// A prova de que é artefato da versão: `cache` (pyo3 0.24), `monitor` (0.25)
+// e `scheduler` (0.29) não emitem o aviso com os mesmos padrões.
+//
+// ⚠️ O preço é real: uma conversão inútil de verdade escrita neste módulo
+// passa despercebida. Este `allow` sai junto com o P3-2, quando o audit
+// subir de pyo3 — e é o único motivo de ele existir.
+#![allow(clippy::useless_conversion)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -354,8 +368,8 @@ impl AuditLogger {
 
         // Igual a `log()`: tudo que trava o `Mutex` ou faz rede roda com
         // o GIL liberado (REGRA CRÍTICA na doc da struct).
-        let (flushed, failed, still_pending) =
-            py.allow_threads(|| -> Result<(usize, usize, usize), crate::errors::AuditError> {
+        let (flushed, failed, still_pending) = py.allow_threads(
+            || -> Result<(usize, usize, usize), crate::errors::AuditError> {
                 // Primeiro a parte cara/lenta (rede), SEM segurar o lock:
                 // acumulamos os receipts a gravar e os ids a remover da fila.
                 // `receipts` junta entregues e permanentes-falhados (ambos
@@ -397,7 +411,8 @@ impl AuditLogger {
                 storage::remove_events(&pending_path, &handled)?;
 
                 Ok((flushed, failed, total - flushed - failed))
-            })?;
+            },
+        )?;
 
         let dict = PyDict::new_bound(py);
         dict.set_item("flushed", flushed)?;
@@ -439,13 +454,16 @@ impl AuditLogger {
         immutable_trail: Option<&str>,
     ) -> Result<ImmutableLogReceipt, crate::immutablelog_client::ImmutableLogClientError> {
         use crate::immutablelog_client::ImmutableLogClientError;
-        let client = self.client.as_ref().ok_or_else(|| ImmutableLogClientError::Permanent {
-            status: None,
-            reason: format!(
-                "mode='{}' exige um cliente ImmutableLog inicializado (estado inconsistente)",
-                self.mode.as_str()
-            ),
-        })?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| ImmutableLogClientError::Permanent {
+                status: None,
+                reason: format!(
+                    "mode='{}' exige um cliente ImmutableLog inicializado (estado inconsistente)",
+                    self.mode.as_str()
+                ),
+            })?;
 
         send_with_retry(
             client,
@@ -530,7 +548,8 @@ impl AuditLogger {
                 // a entrega chegou ao ImmutableLog o registro existe no
                 // destino remoto (a fonte de verdade no modo hybrid).
                 let (receipt, queue_for_retry) =
-                    match self.deliver(&event, resolved_severity, event.immutable_trail.as_deref()) {
+                    match self.deliver(&event, resolved_severity, event.immutable_trail.as_deref())
+                    {
                         Ok(receipt) => (receipt, false),
                         Err(err) if err.is_retryable() => {
                             // Transitório: vira `pending` e entra na fila

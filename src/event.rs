@@ -126,7 +126,8 @@ mod tests {
         let event = sample_event();
 
         let json = serde_json::to_string(&event).expect("serialização não deveria falhar");
-        let parsed: AuditEvent = serde_json::from_str(&json).expect("desserialização não deveria falhar");
+        let parsed: AuditEvent =
+            serde_json::from_str(&json).expect("desserialização não deveria falhar");
 
         assert_eq!(event, parsed);
     }
