@@ -5,6 +5,24 @@ Todas as mudanças relevantes deste projeto são registradas aqui.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e o versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.4.1] — não publicada
+
+Resposta ao incidente da CA eMudhra / emSign (outubro de 2026).
+
+### Segurança
+
+- **`webpki-roots` 1.0.8 → 1.0.10.** O cliente do ImmutableLog (`reqwest` com
+  `rustls-tls`) não usa o certifi nem o repositório de certificados do sistema:
+  as raízes confiáveis vêm do `webpki-roots`, **compiladas dentro da wheel**.
+  A 0.4.0 e anteriores embutiam a raiz **"emSign ECC Root CA - G3"**, removida
+  dos bundles de CA depois do comprometimento de chaves intermediárias da
+  eMudhra — confiar nela abre espaço para MITM na conexão com o ImmutableLog. A
+  1.0.10 remove essa raiz (e a "Atos TrustedRoot 2011") e acrescenta SECOM TLS
+  2024 e Telia TLS v3. Afeta só os modos `remote` e `hybrid`; `mode="local"`
+  não abre conexão nenhuma.
+- Atualizar `pip`/`certifi` no ambiente **não** corrige versões anteriores da
+  biblioteca: é preciso instalar a 0.4.1.
+
 ## [0.4.0] — não publicada
 
 Cadeia de hashes segura com vários processos (**P2-4**).
