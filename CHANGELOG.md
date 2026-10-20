@@ -5,6 +5,47 @@ Todas as mudanças relevantes deste projeto são registradas aqui.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e o versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.4.0] — não publicada
+
+Cadeia de hashes segura com vários processos (**P2-4**).
+
+### Corrigido
+
+- **Vários workers no mesmo JSONL quebravam a cadeia.** Cada processo
+  encadeava no `last_hash` que tinha em memória; com gunicorn ou
+  `uvicorn --workers`, dois eventos saíam com o mesmo `previous_hash` e o
+  `verify()` acusava `broken_chain` num arquivo que ninguém adulterou. O modo
+  de falha era silencioso até alguém rodar `verify()`. Reproduzido na 0.3.3
+  com 4 processos × 50 eventos: `{'valid': False, 'error_index': 1,
+  'reason': 'broken_chain'}`. Na 0.4.0 o mesmo teste dá `valid: True` com os
+  200 eventos.
+
+### Adicionado
+
+- **Lock de arquivo entre processos** (`fs2`: `flock` no Unix, `LockFileEx` no
+  Windows) num `<file_path>.lock` ao lado do log — à parte, porque o
+  `flush_pending()` troca o JSONL por `rename` e um lock no próprio arquivo
+  ficaria preso ao inode antigo. Com o lock, o logger confere se o arquivo
+  cresceu desde o seu último append; se cresceu, relê o último hash **só do fim
+  do arquivo**. O handle do `.lock` fica aberto no logger, então o custo do
+  caminho comum não mudou (~29 µs por `log()`, medido antes e depois).
+- **`fsync`** no construtor (padrão `False`). Com `True`, o `log()` só volta
+  depois de o evento estar no disco. Custa ~3,3 ms por evento no macOS
+  (`F_FULLFSYNC`), por isso é opt-in.
+- A reescrita atômica do `flush_pending()` agora faz `sync_data` antes do
+  `rename`, para uma queda de energia não deixar o arquivo final truncado.
+
+### Compatibilidade
+
+- Nenhum parâmetro existente mudou. Aparece um arquivo `<file_path>.lock` ao
+  lado do JSONL nos modos `local`/`hybrid`.
+- Em `mode="hybrid"` com vários workers, a entrega ao ImmutableLog acontece
+  dentro do lock (o hash enviado depende do anterior), então os `log()` dos
+  workers passam a se serializar também no tempo de rede.
+- Arquivos já gravados por vários workers em versões anteriores continuam
+  falhando no `verify()` a partir do primeiro entrelaçamento — o que eles têm
+  é o defeito antigo, não um efeito desta versão.
+
 ## [0.3.3] — não publicada
 
 Correção do passo de verificação pós-upload introduzido na 0.3.2, mais o

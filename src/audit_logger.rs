@@ -71,14 +71,19 @@ use crate::verifier::verify_chain;
 /// segura o lock. Por isso `log()`/`flush_pending()`/`last_hash()`
 /// envolvem o uso do lock em `allow_threads`.
 ///
-/// Limitação consciente do MVP: esse cache assume que só **este**
-/// `AuditLogger` (este processo) escreve no arquivo. Se dois processos
-/// diferentes apontarem para o mesmo `file_path` e chamarem `log()`
-/// concorrentemente, o cache de um processo pode ficar desatualizado em
-/// relação ao que o outro gravou — a cadeia no arquivo continuaria
-/// íntegra (cada processo encadeia com o que *ele* sabia ser o último
-/// hash), mas teríamos duas pontas de cadeia em paralelo. Resolver isso
-/// exigiria lock de arquivo entre processos, fora do escopo do MVP.
+/// Vários processos (desde a 0.4): o `Mutex` só serializa threads do
+/// MESMO processo. Com vários workers (gunicorn, uvicorn --workers)
+/// gravando no mesmo `file_path`, cada um tinha seu próprio `last_hash` em
+/// memória — dois eventos acabavam com o mesmo `previous_hash` e
+/// `verify()` acusava adulteração num arquivo que ninguém adulterou. Agora,
+/// nos modos que gravam local (`local`/`hybrid`), a seção crítica também
+/// segura um lock de arquivo entre processos (`storage::ChainLock`, num
+/// `<file_path>.lock` ao lado) e, já com ele, confere se o arquivo cresceu
+/// desde o nosso último append: se cresceu, outro processo gravou, e o
+/// `last_hash` é relido do fim do arquivo (só a última linha). Se não
+/// cresceu, o cache vale — o caso de um processo só continua O(1).
+///
+/// Ordem dos locks: sempre o `Mutex` primeiro, depois o `ChainLock`.
 ///
 /// Limitação específica de `mode="remote"`: como esse modo NÃO grava
 /// JSONL local, `last_hash` vive apenas em memória. Ao recriar o
@@ -93,7 +98,14 @@ use crate::verifier::verify_chain;
 pub struct AuditLogger {
     app_name: String,
     file_path: PathBuf,
-    last_hash: Mutex<Option<String>>,
+    last_hash: Mutex<ChainHead>,
+    /// `fsync` depois de cada append (padrão `false`). Com `true`, o
+    /// `log()` só volta depois de o evento estar no disco, não só no cache
+    /// do SO — ao custo de ~1–3 ms por evento (`F_FULLFSYNC` no macOS).
+    fsync: bool,
+    /// Handle do `<file_path>.lock`, aberto uma vez. `Some` nos modos que
+    /// gravam local; é o lock entre processos da cadeia.
+    lock_file: Option<std::fs::File>,
     /// Modo de operação (`local`/`remote`/`hybrid`). Por ora só fica
     /// guardado e exposto via getter — `log()` ainda se comporta como
     /// antes (sempre local) independente do valor aqui. O envio remoto
@@ -134,7 +146,9 @@ impl AuditLogger {
         retry_enabled = true,
         max_retries = 3,
         immutablelog_env = None,
+        fsync = false,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         app_name: String,
         file_path: String,
@@ -145,6 +159,7 @@ impl AuditLogger {
         retry_enabled: bool,
         max_retries: u8,
         immutablelog_env: Option<String>,
+        fsync: bool,
     ) -> PyResult<Self> {
         let file_path = PathBuf::from(file_path);
 
@@ -176,10 +191,22 @@ impl AuditLogger {
             .last()
             .map(|event| event.hash.clone());
 
+        let file_len = storage::file_len(&file_path)?;
+        let lock_file = if mode.saves_local_jsonl() {
+            Some(storage::open_lock_file(&file_path)?)
+        } else {
+            None
+        };
+
         Ok(AuditLogger {
             app_name,
             file_path,
-            last_hash: Mutex::new(last_hash),
+            last_hash: Mutex::new(ChainHead {
+                hash: last_hash,
+                file_len,
+            }),
+            fsync,
+            lock_file,
             mode,
             immutablelog,
             client,
@@ -226,6 +253,11 @@ impl AuditLogger {
         self.immutablelog.env.clone()
     }
 
+    #[getter]
+    fn fsync(&self) -> bool {
+        self.fsync
+    }
+
     /// Devolve o hash do último evento gravado, ou `None` se o logger
     /// ainda não registrou nenhum evento (nem leu nenhum de um arquivo
     /// existente).
@@ -244,7 +276,7 @@ impl AuditLogger {
     /// O `allow_threads` em volta do lock segue a REGRA CRÍTICA descrita
     /// na doc da struct: nunca travar o `Mutex` segurando o GIL.
     fn last_hash(&self, py: Python<'_>) -> Option<String> {
-        py.allow_threads(|| self.lock_last_hash().clone())
+        py.allow_threads(|| self.lock_last_hash().hash.clone())
     }
 
     /// Registra um novo evento de auditoria.
@@ -406,9 +438,21 @@ impl AuditLogger {
                 // serializando contra um `log()` concorrente. As funções em
                 // lote releem os arquivos aqui dentro, então eventos
                 // acrescentados nesse meio-tempo são preservados.
-                let _guard = self.lock_last_hash();
+                // O `ChainLock` também: outro worker pode estar anexando ao
+                // mesmo arquivo, e a reescrita (ler + trocar por `rename`)
+                // perderia o evento dele.
+                let mut guard = self.lock_last_hash();
+                let _file_lock = self
+                    .lock_file
+                    .as_ref()
+                    .map(storage::ChainLock::acquire)
+                    .transpose()?;
                 storage::update_event_receipts(&self.file_path, &receipts)?;
                 storage::remove_events(&pending_path, &handled)?;
+                // A reescrita muda o tamanho; o hash do fim continua o mesmo
+                // (receipt não entra no hash), mas o próximo `log()` não
+                // precisa reler a cauda por causa de uma mudança nossa.
+                guard.file_len = storage::file_len(&self.file_path)?;
 
                 Ok((flushed, failed, total - flushed - failed))
             },
@@ -421,6 +465,14 @@ impl AuditLogger {
         dict.set_item("total", total)?;
         Ok(dict.into())
     }
+}
+
+/// Ponta da cadeia como este processo a conhece: o hash do último evento e
+/// o tamanho do arquivo logo depois de gravá-lo. Se o arquivo não tiver mais
+/// esse tamanho, outro processo gravou e `hash` está velho.
+struct ChainHead {
+    hash: Option<String>,
+    file_len: u64,
 }
 
 /// Métodos auxiliares internos — fora do bloco `#[pymethods]` de
@@ -436,7 +488,7 @@ impl AuditLogger {
     ///
     /// IMPORTANTE: só chamar com o GIL liberado (ver REGRA CRÍTICA na
     /// doc da struct).
-    fn lock_last_hash(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+    fn lock_last_hash(&self) -> std::sync::MutexGuard<'_, ChainHead> {
         self.last_hash
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -498,6 +550,21 @@ impl AuditLogger {
     ) -> Result<AuditEvent, crate::errors::AuditError> {
         let mut guard = self.lock_last_hash();
 
+        // Modos que gravam local: lock entre processos e, se outro processo
+        // gravou desde o nosso último append (o arquivo mudou de tamanho),
+        // relê o `last_hash` do fim do arquivo antes de encadear.
+        let _file_lock = if let Some(lock_file) = &self.lock_file {
+            let lock = storage::ChainLock::acquire(lock_file)?;
+            let len = storage::file_len(&self.file_path)?;
+            if len != guard.file_len {
+                guard.hash = storage::read_last_hash(&self.file_path)?;
+                guard.file_len = len;
+            }
+            Some(lock)
+        } else {
+            None
+        };
+
         // `hash` começa vazio: só dá para calculá-lo depois que todos os
         // outros campos existem (`compute_hash` ignora o campo `hash`).
         let mut event = AuditEvent {
@@ -509,7 +576,7 @@ impl AuditLogger {
             resource,
             resource_id,
             metadata,
-            previous_hash: guard.clone(),
+            previous_hash: guard.hash.clone(),
             hash: String::new(),
             severity,
             immutable_trail,
@@ -519,8 +586,8 @@ impl AuditLogger {
 
         match self.mode {
             AuditMode::Local => {
-                storage::append_event(&self.file_path, &event)?;
-                *guard = Some(event.hash.clone());
+                guard.file_len = storage::append_event(&self.file_path, &event, self.fsync)?;
+                guard.hash = Some(event.hash.clone());
             }
             AuditMode::Remote => {
                 // Não grava JSONL local: se o envio falhar, o erro sobe
@@ -530,7 +597,7 @@ impl AuditLogger {
                     .deliver(&event, resolved_severity, event.immutable_trail.as_deref())
                     .map_err(crate::errors::AuditError::from)?;
                 event.immutablelog = Some(receipt);
-                *guard = Some(event.hash.clone());
+                guard.hash = Some(event.hash.clone());
             }
             AuditMode::Hybrid => {
                 // Entrega ANTES de gravar, para anexar o evento ao JSONL
@@ -571,10 +638,14 @@ impl AuditLogger {
                 // a ficar gravado como `pending` no arquivo principal sem
                 // estar na fila (preso sem reenvio).
                 if queue_for_retry {
-                    storage::append_event(&storage::pending_path_for(&self.file_path), &event)?;
+                    storage::append_event(
+                        &storage::pending_path_for(&self.file_path),
+                        &event,
+                        self.fsync,
+                    )?;
                 }
-                storage::append_event(&self.file_path, &event)?;
-                *guard = Some(event.hash.clone());
+                guard.file_len = storage::append_event(&self.file_path, &event, self.fsync)?;
+                guard.hash = Some(event.hash.clone());
             }
         }
 

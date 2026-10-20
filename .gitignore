@@ -9,3 +9,7 @@ build/
 *.pyd
 .pytest_cache/
 *.jsonl
+*.jsonl.lock
+
+# macOS
+.DS_Store

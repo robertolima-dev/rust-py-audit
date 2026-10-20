@@ -18,7 +18,8 @@ Records audit events (`who did what, when, on which resource`) in a fast, struct
 - **`AuditLogger`** — simple API: `log(...)`, `verify()`, `last_hash()`
 - **Hash chain (SHA-256)** — each event embeds the hash of the previous event; altering any recorded event breaks the chain in a detectable way
 - **JSONL storage** — one event per line, append-only, no database required
-- **Thread-safe** — a single `AuditLogger` can be shared across threads (e.g. a multi-threaded WSGI server, or one middleware instance serving concurrent requests); the hash chain stays linear under concurrency
+- **Thread-safe and multi-process-safe** — share one `AuditLogger` across threads, or point several worker processes (gunicorn, `uvicorn --workers`) at the same file: a cross-process file lock keeps the hash chain linear (see [Multiple workers](#multiple-workers))
+- **Optional `fsync`** — `fsync=True` makes `log()` return only once the event is on disk, surviving a power loss
 - **Free-form `metadata`** — any JSON-serializable `dict` (IP, reason, request_id, etc.)
 - **FastAPI middleware** — automatically logs state-changing requests (POST/PUT/PATCH/DELETE)
 - **Django middleware** — same idea, supports WSGI and ASGI
@@ -106,6 +107,53 @@ If any event was edited, removed, or reordered:
 {"valid": False, "total_events": 10, "error_index": 4, "reason": "hash_mismatch"}
 # or "reason": "broken_chain" (removed/reordered/forged event)
 ```
+
+### Multiple workers
+
+Several processes can write to the same `file_path` — the usual gunicorn /
+`uvicorn --workers N` setup with one `AuditLogger` (or middleware) per worker:
+
+```python
+# every worker
+audit = AuditLogger(app_name="billing-api", file_path="/var/log/billing/audit.jsonl")
+```
+
+Each append takes an exclusive file lock on `<file_path>.lock` (created next to
+the log; `flock` on Unix, `LockFileEx` on Windows). Holding it, the logger checks
+whether the file grew since its own last write — meaning another worker wrote —
+and, if so, re-reads the last hash from the **tail** of the file before chaining.
+A single process never pays for that re-read, and the lock costs microseconds.
+
+Before 0.4.0 each process chained onto the last hash it kept in memory, so two
+workers produced events with the same `previous_hash` and `verify()` reported
+`broken_chain` on a file nobody had tampered with. If you ran several workers on
+an older version, `verify()` on that file will fail at the first point where two
+workers interleaved; start a new file after upgrading.
+
+Notes:
+
+- The lock is advisory and needs a filesystem with working locks — a local disk,
+  not most NFS/SMB mounts.
+- In `mode="hybrid"` the network delivery happens inside the lock (the event's
+  hash, sent to ImmutableLog, depends on the previous one), so concurrent
+  `log()` calls across workers serialize on delivery time too — bounded by
+  `timeout_ms`.
+- `mode="remote"` writes no local file and takes no lock; chain continuity there
+  is ImmutableLog's job.
+
+### Durability (`fsync`)
+
+By default `log()` returns once the event is handed to the operating system,
+which survives the **process** crashing but not the **machine** losing power. For
+a hard guarantee, pass `fsync=True`:
+
+```python
+audit = AuditLogger(app_name="billing-api", fsync=True)
+```
+
+Every append then waits for the disk. It is expensive — about 3 ms per event on
+macOS (which uses `F_FULLFSYNC`) and typically 0.1–2 ms on Linux SSDs, versus
+~30 µs without it — so it is opt-in.
 
 ---
 
@@ -303,7 +351,7 @@ audit.verify()         # still valid, even after flush_pending()
 
 ## API Reference
 
-### `AuditLogger(app_name, file_path="./audit.jsonl", mode=None, immutablelog_url=None, immutablelog_api_key=None, timeout_ms=500, retry_enabled=True, max_retries=3, immutablelog_env=None)`
+### `AuditLogger(app_name, file_path="./audit.jsonl", mode=None, immutablelog_url=None, immutablelog_api_key=None, timeout_ms=500, retry_enabled=True, max_retries=3, immutablelog_env=None, fsync=False)`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -316,6 +364,7 @@ audit.verify()         # still valid, even after flush_pending()
 | `retry_enabled` | `bool` | If `True`, retries retryable errors (5xx, timeout) up to `max_retries` times |
 | `max_retries` | `int` | Maximum number of retries (in addition to the initial attempt) |
 | `immutablelog_env` | `str \| None` | Logical environment (`meta.env`, e.g. `"production"`). `None` falls back to `IMMUTABLELOG_ENV`; if neither is set, the field is omitted |
+| `fsync` | `bool` | If `True`, every local append is flushed to disk before `log()` returns. See [Durability](#durability-fsync) |
 
 See [ImmutableLog Integration](#immutablelog-integration) for details on each mode.
 

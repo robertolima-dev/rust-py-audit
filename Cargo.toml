@@ -1,6 +1,6 @@
 [package]
 name = "rust_py_audit"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 description = "Auditoria de eventos com cadeia de hashes (SHA-256) para apps Python, core em Rust via PyO3."
 license = "MIT"
@@ -59,6 +59,11 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde-well-known
 # (OpenSSL via "native-tls") evita exigir libssl-dev/headers do sistema
 # em cada plataforma onde o wheel é compilado/distribuído.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# fs2: lock de arquivo entre processos (`flock` no Unix, `LockFileEx` no
+# Windows). Serializa o append da cadeia quando vários workers (gunicorn,
+# uvicorn --workers) gravam no mesmo JSONL. `File::lock` da std resolveria,
+# mas só estabilizou no Rust 1.89 e a CI fixa 1.88.
+fs2 = "0.4"
 
 [dev-dependencies]
 # httpmock: servidor HTTP local de mentirinha, usado só em `cargo test`

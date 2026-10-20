@@ -34,6 +34,15 @@ what is done and the **directional** ideas under consideration.
 
 ---
 
+## Shipped in 0.4.0
+
+- ✅ **Multi-process safety** — a cross-process file lock (`<file_path>.lock`)
+  serializes appends; a logger re-reads the last hash from the file tail when
+  another process wrote since its last append. Several gunicorn/uvicorn workers
+  can share one JSONL and `verify()` stays valid.
+- ✅ **Optional `fsync`** (`AuditLogger(..., fsync=True)`), and the atomic
+  rewrite used by `flush_pending()` now syncs before its `rename`.
+
 ## Directional ideas (no version assigned — confirm before planning)
 
 - 💡 **Log rotation / segmentation** — roll the JSONL by size or date while
@@ -53,6 +62,10 @@ what is done and the **directional** ideas under consideration.
 ## Known limitations (by design, for now)
 
 - Local JSONL is single-file and append-only (no built-in rotation yet).
+- The cross-process lock needs a filesystem with working advisory locks (local
+  disk; most NFS/SMB mounts don't qualify).
+- In `mode="hybrid"`, delivery runs inside the cross-process lock, so workers
+  serialize on network time (bounded by `timeout_ms`).
 - `verify()` re-reads the entire file (O(n)); fine for typical logs, see the
   incremental-verification idea above for very large files.
 - ImmutableLog delivery is synchronous on the `log()` path (bounded by
